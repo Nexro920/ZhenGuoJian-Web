@@ -86,6 +86,15 @@ func TestYeguoScriptAPIBaseFollowsRequestHelper(t *testing.T) {
 	if got := yeguoScriptAPIBase("ud=()=>`https://api.example/api.php?x=1`;u(e,{baseURL:ud()})"); got != "" {
 		t.Fatalf("api base with query accepted: %q", got)
 	}
+	templateScript := "globalThis.$fetch=ca.create({baseURL:da()});Ef=()=>`https://origin.example/api.php`," +
+		"Qf=(e='')=>{let t=Ef();let{hostname:n,origin:r}=window.location;return n==='localhost'?t:`${r}/api.php`};" +
+		"function $(e,n){return d(e,{baseURL:Qf(a),method:'POST'})}"
+	if got := yeguoScriptAPIBase(templateScript); got != "https://origin.example/api.php" {
+		t.Fatalf("helper fallback api base = %q", got)
+	}
+	if got := yeguoScriptAPIBaseForSite(templateScript, "https://mirror.example"); got != "https://mirror.example/api.php" {
+		t.Fatalf("site template api base = %q", got)
+	}
 }
 
 func TestResolveYeguoMediaKeepsCodecAlternatives(t *testing.T) {

@@ -42,8 +42,8 @@ var (
 	huangguoAIBaseMirrors = []string{"https://huangguoai.com", "https://ttvoij.ediayikma.cc", "https://thu.ediayikma.cc", "https://pku.ediayikma.cc", "https://fdu.ediayikma.cc", "https://thu.agdkczeyx.cc"}
 	huangguoVideoBaseURL  = "https://huangguo.video"
 
-	huangguoAISlugs     = []string{"recommend", "newest", "ai-duanju", "ai-manju", "ai-huanlian", "ai-mogai", "ranks/hot"}
-	huangguoAITypeNames = map[string]string{"recommend": "精选推荐", "newest": "最近上新", "ai-duanju": "AI成人短剧", "ai-manju": "AI成人漫剧", "ai-huanlian": "AI换脸", "ai-mogai": "AI魔改", "ranks/hot": "排行榜"}
+	huangguoAISlugs     = []string{"recommend", "newest", "ai-duanju", "ai-manju", "ranks/hot"}
+	huangguoAITypeNames = map[string]string{"recommend": "精选推荐", "newest": "最近上新", "ai-duanju": "AI成人短剧", "ai-manju": "AI成人漫剧", "ranks/hot": "排行榜"}
 
 	reVideoCard       = regexp.MustCompile(`(?is)<article\b[^>]*class=["'][^"']*\bvideo-card\b[^"']*["'][^>]*>.*?</article>`)
 	reVideoCardMeta   = regexp.MustCompile(`(?is)<p\b[^>]*class=["'][^"']*\bfont-mono-meta\b[^"']*["'][^>]*>(.*?)</p>`)
@@ -317,9 +317,12 @@ func (d *Downloader) fetchProviderRequest(ctx context.Context, rawURL, referer s
 		referer = rawURL
 	}
 	candidates := d.providerURLCandidates(rawURL)
+	if singleHost, _ := ctx.Value(providerSingleHostKey{}).(bool); singleHost {
+		candidates = []string{rawURL}
+	}
 	var lastErr error
 	tried := 0
-	for _, candidate := range candidates {
+	for candidateIdx, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
@@ -338,7 +341,11 @@ func (d *Downloader) fetchProviderRequest(ctx context.Context, rawURL, referer s
 			}
 			timeout := providerTimeout
 			if len(candidates) > 1 {
-				timeout = 5 * time.Second
+				if candidateIdx == 0 {
+					timeout = 12 * time.Second
+				} else {
+					timeout = 5 * time.Second
+				}
 			}
 			method, requestBody := http.MethodGet, io.Reader(nil)
 			if payload != nil {

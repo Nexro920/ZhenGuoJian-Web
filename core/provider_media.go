@@ -13,6 +13,7 @@ type providerMedia struct {
 	credentials *providerMediaCredentials
 	URL         string
 	Referer     string
+	Codec       string
 	Duration    time.Duration
 	Playlist    string
 	HLSKey      []byte
@@ -185,11 +186,11 @@ func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (provi
 		if !valid {
 			return providerMedia{}, fmt.Errorf("黄果剧集信息无效")
 		}
-		address, err := d.fetchHuangguoAIPlayURL(ctx, sourceID, chapterEpisodeNumber(chapter, task.Index))
+		aiMedia, err := d.fetchHuangguoAIMedia(ctx, sourceID, chapterEpisodeNumber(chapter, task.Index))
 		if err != nil {
 			return providerMedia{}, err
 		}
-		media.URL = address
+		media = aiMedia
 	}
 	if chapter.PageURL != "" && chapter.Source == sourceHuangguoVideo {
 		responses := &playbackResponseURLs{}

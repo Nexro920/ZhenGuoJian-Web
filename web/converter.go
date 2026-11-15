@@ -111,6 +111,23 @@ func findFFmpegBinary() string {
 			return custom
 		}
 	}
+	names := []string{"ffmpeg", "ffmpeg.exe"}
+	var dirs []string
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		exeDir := filepath.Dir(exe)
+		dirs = append(dirs, exeDir, filepath.Join(exeDir, "bin"), filepath.Join(exeDir, "ffmpeg", "bin"))
+	}
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		dirs = append(dirs, wd, filepath.Join(wd, "bin"), filepath.Join(wd, "ffmpeg", "bin"))
+	}
+	for _, dir := range dirs {
+		for _, name := range names {
+			candidate := filepath.Join(dir, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
 	if found, err := exec.LookPath("ffmpeg"); err == nil {
 		return found
 	}

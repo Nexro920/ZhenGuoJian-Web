@@ -126,6 +126,9 @@
       this.handlingFailureEpoch = -1;
       this.triedTranscode = false;
       this.probedHlsForUrl = "";
+      this.baseStreamUrl = "";
+      this.transcodeOffset = 0;
+      this.noPictureTimer = null;
 
       this._boundKeyDown = this._handleKeyDown.bind(this);
       this._boundFullscreenChange = () => {
@@ -418,6 +421,7 @@
       this.active = false;
       clearTimeout(this.loadingDelayTimer);
       clearTimeout(this.preloadDelayTimer);
+      clearTimeout(this.noPictureTimer);
       clearTimeout(this.hideControlsTimer);
       clearTimeout(this._hudTimer);
       clearInterval(this.progressSaveTimer);
@@ -499,6 +503,7 @@
     _destroyMedia(fullReset) {
       this.attachEpoch++;
       this.ignoringMediaError = true;
+      clearTimeout(this.noPictureTimer);
       if (this.hls) {
         try {
           this.hls.destroy();
@@ -567,6 +572,17 @@
             hls.recoverMediaError();
           } else {
             API.addLog(`[播放器] HLS 致命错误 (${data.type}/${data.details || "unknown"}) url=${url}`);
+            if (
+              window.ZGJApp &&
+              window.ZGJApp.ffmpegReady &&
+              !this.triedTranscode &&
+              this.plan &&
+              !String(this.plan.url || "").includes("transcode=h264") &&
+              (this.plan.codec === "hevc" || data.type === HlsLib.ErrorTypes.MEDIA_ERROR)
+            ) {
+              this._switchToH264Transcode(this.resolveEpoch, this.attachEpoch, "HLS 流兼容转码");
+              return;
+            }
             this._handleMediaFailure("流媒体分片加载失败", this.attachEpoch);
           }
         }
@@ -692,6 +708,9 @@
       this.fallbackCount = 0;
       this.triedTranscode = false;
       this.probedHlsForUrl = "";
+      this.baseStreamUrl = "";
+      this.transcodeOffset = 0;
+      clearTimeout(this.noPictureTimer);
       this.danmakuBuckets.clear();
       this.danmakuFired.clear();
       this.danmakuLoadingKey = "";
@@ -789,13 +808,187 @@
       }
     }
 
+    _effectiveDuration() {
+      const vd = this.video ? Number(this.video.duration) : NaN;
+      if (Number.isFinite(vd) && vd > 0) return vd;
+      const pd = this.plan ? Number(this.plan.duration) : NaN;
+      if (Number.isFinite(pd) && pd > 0) return pd;
+      return 0;
+    }
+
+    _effectiveCurrentTime() {
+      const vt = this.video ? Number(this.video.currentTime) : 0;
+      return (Number.isFinite(vt) ? vt : 0) + (this.transcodeOffset || 0);
+    }
+
+    _hasValidVideoPicture(v) {
+      return !!(v && v.videoWidth > 0 && v.videoHeight > 0);
+    }
+
+    async _canBrowserDecodeHevc() {
+      if (window._zgjHevcUnsupported === true) return false;
+      const v = this.video || document.createElement("video");
+      if (navigator.mediaCapabilities && typeof navigator.mediaCapabilities.decodingInfo === "function") {
+        try {
+          const info = await navigator.mediaCapabilities.decodingInfo({
+            type: "file",
+            video: {
+              contentType: 'video/mp4; codecs="hvc1.1.6.L93.B0"',
+              width: 1080,
+              height: 1920,
+              bitrate: 2000000,
+              framerate: 30
+            }
+          });
+          if (!info || !info.supported) {
+            return false;
+          }
+          return true;
+        } catch (_) {}
+      }
+      if (v && typeof v.canPlayType === "function") {
+        const a = v.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"');
+        const b = v.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"');
+        if (!a && !b) return false;
+      }
+      return true;
+    }
+
+    _buildTranscodedUrl(startSec) {
+      const raw = this.baseStreamUrl || (this.plan ? String(this.plan.url || "") : "");
+      if (!raw) return "";
+      const clean = raw.replace(/([?&])(transcode|start)=[^&]*/g, "").replace(/[?&]+$/, "");
+      const sep = clean.includes("?") ? "&" : "?";
+      const pos = Number(startSec) > 1 ? `&start=${Number(startSec).toFixed(1)}` : "";
+      return `${clean}${sep}transcode=h264${pos}`;
+    }
+
+    async _switchToH264Transcode(epoch, curAttach, reasonText) {
+      if (!this.active || !this.plan || epoch !== this.resolveEpoch || curAttach !== this.attachEpoch) return false;
+      if (!window.ZGJApp || !window.ZGJApp.ffmpegReady || this.triedTranscode) return false;
+      if (!this.baseStreamUrl) {
+        this.baseStreamUrl = String(this.plan.url || "").replace(/([?&])(transcode|start)=[^&]*/g, "").replace(/[?&]+$/, "");
+      }
+      if (!this.baseStreamUrl) return false;
+      const curPos = this.resumePosition > 1 ? this.resumePosition : this._effectiveCurrentTime();
+      const startSec = curPos > 1 ? Math.floor(curPos * 10) / 10 : 0;
+      const transUrl = this._buildTranscodedUrl(startSec);
+      if (!transUrl) return false;
+
+      this.triedTranscode = true;
+      this.transcodeOffset = startSec;
+      this.resumePosition = 0;
+      this.plan = {
+        ...this.plan,
+        isHls: false,
+        url: transUrl
+      };
+      if (reasonText) {
+        API.addLog(`[播放器] ${reasonText}，启用 H.264 转码`);
+      }
+      toast("已自动启用 H.264 兼容模式播放");
+      await this._attachStream(this.plan, epoch);
+      return true;
+    }
+
+    _scheduleNoVideoPictureCheck(v) {
+      clearTimeout(this.noPictureTimer);
+      if (!this.active || !v || v !== this.video || !this.plan) return;
+      if (this._hasValidVideoPicture(v)) return;
+      if (String(this.plan.url || "").includes("transcode=h264")) return;
+      const epoch = this.resolveEpoch;
+      const curAttach = this.attachEpoch;
+      this.noPictureTimer = setTimeout(() => {
+        if (!this.active || v !== this.video || epoch !== this.resolveEpoch || curAttach !== this.attachEpoch) return;
+        if (v.readyState >= 2 && !this._hasValidVideoPicture(v)) {
+          this._handleNoPictureFailure(epoch, curAttach);
+        }
+      }, 450);
+    }
+
+    async _handleNoPictureFailure(epoch, curAttach) {
+      if (!this.active || !this.plan || epoch !== this.resolveEpoch || curAttach !== this.attachEpoch) return;
+      if (this.handlingFailureEpoch === curAttach) return;
+      this.handlingFailureEpoch = curAttach;
+      clearTimeout(this.noPictureTimer);
+      if (this.plan.codec === "hevc") {
+        window._zgjHevcUnsupported = true;
+      }
+      if (await this._switchToH264Transcode(epoch, curAttach, "检测到视频只有声音没有画面（videoWidth=0）")) {
+        return;
+      }
+      API.addLog("[播放器] 检测到视频有声无画，尝试切换备用线路");
+      const msg = "检测到当前视频只有声音没有画面（可能为 HEVC/H.265 编码不兼容，且未检测到可用的 FFmpeg 转码环境）";
+      await this._handleMediaFailure(msg, curAttach, false);
+    }
+
+    async _seekToAbsolute(targetSec) {
+      if (!this.video || !this.plan) return;
+      const dur = this._effectiveDuration();
+      const target = Math.max(0, dur > 0 ? Math.min(dur, targetSec) : Math.max(0, targetSec));
+      const url = String(this.plan.url || "");
+      if (url.includes("transcode=h264")) {
+        const localTarget = target - (this.transcodeOffset || 0);
+        let inBuffered = false;
+        try {
+          for (let i = 0; i < this.video.buffered.length; i++) {
+            if (localTarget >= this.video.buffered.start(i) && localTarget <= this.video.buffered.end(i)) {
+              inBuffered = true;
+              break;
+            }
+          }
+        } catch (_) {}
+        if (inBuffered && localTarget >= 0) {
+          this.video.currentTime = localTarget;
+        } else {
+          const epoch = this.resolveEpoch;
+          this.transcodeOffset = Math.floor(target * 10) / 10;
+          this.resumePosition = 0;
+          this.loading = true;
+          this._syncUI();
+          this.plan = {
+            ...this.plan,
+            isHls: false,
+            url: this._buildTranscodedUrl(this.transcodeOffset)
+          };
+          await this._attachStream(this.plan, epoch);
+        }
+      } else if (Number.isFinite(this.video.duration) && this.video.duration > 0) {
+        this.video.currentTime = target;
+      }
+      this.danmakuFired.clear();
+      this._ensureDanmakuWindow();
+    }
+
     async _attachStream(plan, epoch) {
       if (!this.video || !plan || !plan.url) {
         throw new Error("未获取到有效播放地址");
       }
       const video = this.video;
+      const rawUrl = String(plan.url);
+      const isTranscoded = rawUrl.includes("transcode=h264");
+      if (!isTranscoded) {
+        this.baseStreamUrl = rawUrl;
+        this.transcodeOffset = 0;
+        if (plan.codec === "hevc" && !this.triedTranscode && window.ZGJApp && window.ZGJApp.ffmpegReady) {
+          const canHevc = await this._canBrowserDecodeHevc();
+          if (epoch !== this.resolveEpoch || !this.active) return;
+          if (!canHevc) {
+            const startSec = this.resumePosition > 1 ? Math.floor(this.resumePosition * 10) / 10 : 0;
+            const transUrl = this._buildTranscodedUrl(startSec);
+            if (transUrl) {
+              this.triedTranscode = true;
+              this.transcodeOffset = startSec;
+              this.resumePosition = 0;
+              plan = { ...plan, isHls: false, url: transUrl };
+              this.plan = plan;
+            }
+          }
+        }
+      }
+
       const url = plan.url;
-      const isHLS = plan.isHls === true || url.toLowerCase().includes(".m3u8");
+      const isHLS = !url.includes("transcode=h264") && (plan.isHls === true || url.toLowerCase().includes(".m3u8"));
 
       this._destroyMedia(false);
       const curAttach = this.attachEpoch;
@@ -861,8 +1054,8 @@
       this.handlingFailureEpoch = curAttach;
       const epoch = this.resolveEpoch;
 
-      let hevcUnsupported = false;
-      if (!this.plan.isHls && !this.plan.local && !failedUrl.includes("transcode=h264") && this.probedHlsForUrl !== failedUrl) {
+      let hevcUnsupported = this.plan.codec === "hevc";
+      if (!failedUrl.includes("transcode=h264") && !this.plan.local && !this.plan.isHls && this.probedHlsForUrl !== failedUrl) {
         this.probedHlsForUrl = failedUrl;
         try {
           const resp = await fetch(failedUrl, {
@@ -881,28 +1074,19 @@
             return;
           }
           const fullLatin1 = Array.from(buf, (b) => String.fromCharCode(b)).join("");
-          if (
-            (errCode === 3 || errCode === 4) &&
-            (fullLatin1.includes("hvc1") || fullLatin1.includes("hev1")) &&
-            !this.video.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"')
-          ) {
+          if (fullLatin1.includes("hvc1") || fullLatin1.includes("hev1")) {
             hevcUnsupported = true;
-            if (window.ZGJApp && window.ZGJApp.ffmpegReady && !this.triedTranscode) {
-              this.triedTranscode = true;
-              const curPos = this.resumePosition > 1 ? this.resumePosition : (this.video ? this.video.currentTime : 0);
-              const sep = this.plan.url.includes("?") ? "&" : "?";
-              const transPlan = {
-                ...this.plan,
-                url: `${this.plan.url}${sep}transcode=h264${curPos > 1 ? `&start=${curPos.toFixed(1)}` : ""}`
-              };
-              this.resumePosition = 0;
-              this.plan = transPlan;
-              toast("当前浏览器不支持 HEVC 直解，已自动启用 FFmpeg 兼容转码");
-              await this._attachStream(transPlan, epoch);
-              return;
-            }
           }
         } catch (_) {}
+      }
+
+      if ((errCode === 3 || errCode === 4) && !failedUrl.includes("transcode=h264") && (hevcUnsupported || this.plan.local || this.plan.isHls)) {
+        if (hevcUnsupported) {
+          window._zgjHevcUnsupported = true;
+        }
+        if (await this._switchToH264Transcode(epoch, curAttach, `原生解码错误 (code=${errCode})`)) {
+          return;
+        }
       }
 
       API.addLog(`[播放器] 原生解码或网络错误 (code=${errCode}) url=${failedUrl}`);
@@ -938,6 +1122,9 @@
           }
           this.triedTranscode = false;
           this.probedHlsForUrl = "";
+          this.baseStreamUrl = "";
+          this.transcodeOffset = 0;
+          clearTimeout(this.noPictureTimer);
           this.plan = nextPlan;
           await this._attachStream(nextPlan, epoch);
           return;
@@ -1084,7 +1271,11 @@
 
       const sv = this.standbyVideo;
       const url = plan.url;
-      const isHLS = plan.isHls === true || url.toLowerCase().includes(".m3u8");
+      if (plan.codec === "hevc" && window.ZGJApp && window.ZGJApp.ffmpegReady && !(await this._canBrowserDecodeHevc())) {
+        return;
+      }
+      if (!this.active || sbEpoch !== this.standbyEpoch || this.preloadedKey !== key) return;
+      const isHLS = !url.includes("transcode=h264") && (plan.isHls === true || url.toLowerCase().includes(".m3u8"));
       sv.muted = true;
       sv.preload = "auto";
 
@@ -1115,9 +1306,9 @@
       if (!this.danmakuEnabled || !this.plan || this.plan.local || !this.plan.session || !this.plan.danmakuId || !this.video) {
         return;
       }
-      const durSec = Number(this.video.duration);
+      const durSec = this._effectiveDuration();
       const durMs = Number.isFinite(durSec) && durSec > 1 ? Math.floor(durSec * 1000) : 600000;
-      const curMs = Math.max(0, Math.floor((this.video.currentTime || 0) * 1000));
+      const curMs = Math.max(0, Math.floor(this._effectiveCurrentTime() * 1000));
       const winStart = Math.floor(curMs / DANMAKU_WINDOW_MS) * DANMAKU_WINDOW_MS;
       if (winStart >= durMs || this.danmakuBuckets.has(winStart)) return;
       const reqKey = `${this.plan.session}:${winStart}`;
@@ -1144,7 +1335,7 @@
     _tickDanmaku() {
       if (!this.danmakuEnabled || !this.video || this.video.paused) return;
       this._ensureDanmakuWindow();
-      const curMs = Math.floor(this.video.currentTime * 1000);
+      const curMs = Math.floor(this._effectiveCurrentTime() * 1000);
       const winStart = Math.floor(curMs / DANMAKU_WINDOW_MS) * DANMAKU_WINDOW_MS;
       const list = this.danmakuBuckets.get(winStart);
       if (!list || list.length === 0) return;
@@ -1191,8 +1382,8 @@
 
     _captureWatchSnapshot() {
       if (!this.drama || !this.drama.id || !this.video) return null;
-      const pos = Number(this.video.currentTime) || 0;
-      const dur = Number.isFinite(this.video.duration) && this.video.duration > 0 ? Number(this.video.duration) : 0;
+      const pos = this._effectiveCurrentTime();
+      const dur = this._effectiveDuration();
       if (pos < 0.5 && dur <= 0) return null;
       if (Math.abs(pos - this.lastSavedPos) < 1.5) return null;
       this.lastSavedPos = pos;
@@ -1443,10 +1634,16 @@
         v.addEventListener("loadeddata", () => {
           if (v === this.standbyVideo && this.standbyPlan && !this.standbyFailed) {
             this.standbyReady = true;
+            return;
           }
+          if (v !== this.video) return;
+          this._scheduleNoVideoPictureCheck(v);
         });
         v.addEventListener("resize", () => {
           if (v !== this.video) return;
+          if (this._hasValidVideoPicture(v)) {
+            clearTimeout(this.noPictureTimer);
+          }
           this._syncFullscreenState();
         });
         v.addEventListener("canplay", () => {
@@ -1462,6 +1659,7 @@
             this.loading = false;
             this._syncUI();
           }
+          this._scheduleNoVideoPictureCheck(v);
         });
         v.addEventListener("waiting", () => {
           if (v !== this.video) return;
@@ -1484,6 +1682,7 @@
           if (this.controlsVisible) {
             this._showControlsTemporarily();
           }
+          this._scheduleNoVideoPictureCheck(v);
           this._queueNextPreload(450);
         });
         v.addEventListener("pause", () => {
@@ -1494,10 +1693,17 @@
         });
         v.addEventListener("timeupdate", () => {
           if (v !== this.video) return;
-          if (!draggingSeek && Number.isFinite(v.duration) && v.duration > 0) {
-            seekInput.value = String(Math.round((v.currentTime / v.duration) * 1000));
-            timeCurEl.textContent = formatTime(v.currentTime);
-            timeDurEl.textContent = formatTime(v.duration);
+          if (this._hasValidVideoPicture(v)) {
+            clearTimeout(this.noPictureTimer);
+          } else if (v.readyState >= 2 && v.currentTime >= 0.25 && !String((this.plan && this.plan.url) || "").includes("transcode=h264")) {
+            this._handleNoPictureFailure(this.resolveEpoch, this.attachEpoch);
+          }
+          const effCur = this._effectiveCurrentTime();
+          const effDur = this._effectiveDuration();
+          if (!draggingSeek && effDur > 0) {
+            seekInput.value = String(Math.min(1000, Math.max(0, Math.round((effCur / effDur) * 1000))));
+            timeCurEl.textContent = formatTime(effCur);
+            timeDurEl.textContent = formatTime(effDur);
           }
           this._tickDanmaku();
         });
@@ -1540,16 +1746,16 @@
 
       const previewSeek = (val) => {
         draggingSeek = true;
-        if (Number.isFinite(this.video.duration) && this.video.duration > 0) {
-          const target = (Number(val) / 1000) * this.video.duration;
+        const dur = this._effectiveDuration();
+        if (dur > 0) {
+          const target = (Number(val) / 1000) * dur;
           root.querySelector(".p-time-cur").textContent = formatTime(target);
         }
       };
       const commitSeek = (val) => {
-        if (Number.isFinite(this.video.duration) && this.video.duration > 0) {
-          this.video.currentTime = (Number(val) / 1000) * this.video.duration;
-          this.danmakuFired.clear();
-          this._ensureDanmakuWindow();
+        const dur = this._effectiveDuration();
+        if (dur > 0) {
+          this._seekToAbsolute((Number(val) / 1000) * dur);
         }
         draggingSeek = false;
       };
@@ -1940,10 +2146,10 @@
     }
 
     _seekBy(deltaSec) {
-      if (!this.video || !Number.isFinite(this.video.duration)) return;
-      const next = Math.max(0, Math.min(this.video.duration, this.video.currentTime + deltaSec));
-      this.video.currentTime = next;
-      this.danmakuFired.clear();
+      const dur = this._effectiveDuration();
+      if (!this.video || dur <= 0) return;
+      const next = Math.max(0, Math.min(dur, this._effectiveCurrentTime() + deltaSec));
+      this._seekToAbsolute(next);
       this._flashHud(`${deltaSec > 0 ? "⏩ +" : "⏪ "}${deltaSec}s (${formatTime(next)})`);
     }
 

@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,6 +129,24 @@ func (d *Downloader) doMediaRequest(request *http.Request) (*http.Response, erro
 	return d.doMediaRequestWithClient(request, d.client)
 }
 
+func (d *Downloader) huangdouInsecureHTTPClient(template *http.Client) *http.Client {
+	d.huangdouClientOnce.Do(func() {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}
+		if d.proxyRouter != nil {
+			transport.Proxy = d.proxyRouter.proxy
+		}
+		d.huangdouInsecure = &http.Client{Transport: transport}
+	})
+	if template == nil || (template.Timeout == 0 && template.CheckRedirect == nil) {
+		return d.huangdouInsecure
+	}
+	cloned := *d.huangdouInsecure
+	cloned.Timeout = template.Timeout
+	cloned.CheckRedirect = template.CheckRedirect
+	return &cloned
+}
+
 func (d *Downloader) doMediaRequestWithClient(request *http.Request, client *http.Client) (*http.Response, error) {
 	mediaRequestHeaders(request, request.Header.Get("Referer"))
 	if credentials, _ := request.Context().Value(providerMediaCredentialsKey{}).(*providerMediaCredentials); credentials != nil {
@@ -147,6 +166,15 @@ func (d *Downloader) doMediaRequestWithClient(request *http.Request, client *htt
 			request.Header.Set("X-Preview-Token", token)
 		}
 		response, err := client.Do(request)
+		if err != nil && (request.Body == nil || request.GetBody != nil) && isHuangdouCertError(request.URL.Hostname(), err) {
+			retryReq := request.Clone(request.Context())
+			if request.GetBody != nil {
+				if body, bodyErr := request.GetBody(); bodyErr == nil {
+					retryReq.Body = body
+				}
+			}
+			response, err = d.huangdouInsecureHTTPClient(client).Do(retryReq)
+		}
 		if err != nil {
 			return nil, err
 		}

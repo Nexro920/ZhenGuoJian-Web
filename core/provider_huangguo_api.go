@@ -14,14 +14,34 @@ import (
 const huangguoAISearchPageSize = 20
 
 func (d *Downloader) huangguoAIAPI(ctx context.Context, path string, out any) error {
-	envelope, err := json.Marshal(map[string]string{"method": http.MethodGet, "path": path, "body": "", "content_type": ""})
-	if err != nil {
-		return err
-	}
 	base := d.providerBaseURL(sourceHuangguoAI)
-	body, err := d.fetchProviderRequest(ctx, base+"/api/edge/request", base+"/", envelope)
-	if err != nil {
-		return err
+	var body string
+	if d.huangguoEdgeMode(base) == "v1" {
+		encryptedBody, err := d.huangguoEdgeCall(ctx, base, http.MethodGet, path)
+		if err != nil {
+			return err
+		}
+		body = string(encryptedBody)
+	} else {
+		envelope, err := json.Marshal(map[string]string{"method": http.MethodGet, "path": path, "body": "", "content_type": ""})
+		if err != nil {
+			return err
+		}
+		singleCtx := context.WithValue(ctx, providerSingleHostKey{}, true)
+		legacyBody, err := d.fetchProviderRequest(singleCtx, base+"/api/edge/request", base+"/", envelope)
+		if err != nil {
+			if !huangguoShouldUseEdgeV1(err) {
+				return err
+			}
+			d.setHuangguoEdgeMode(base, "v1")
+			encryptedBody, edgeErr := d.huangguoEdgeCall(ctx, base, http.MethodGet, path)
+			if edgeErr != nil {
+				return edgeErr
+			}
+			body = string(encryptedBody)
+		} else {
+			body = legacyBody
+		}
 	}
 	var reply struct {
 		Status int             `json:"status"`
@@ -81,18 +101,98 @@ func huangguoAIChapter(base, sourceID string, episode int, title string) Chapter
 		Title: firstNonEmpty(title, fmt.Sprintf("第%d集", episode)), PageURL: pageURL, CurrentEpisode: rawEpisode(episode)}
 }
 
-func (d *Downloader) fetchHuangguoAIPlayURL(ctx context.Context, sourceID string, episode int) (string, error) {
+func huangguoAIPlaybackOptions(base string, data []byte) []providerMedia {
+	var reply struct {
+		Status int `json:"status"`
+		Data   struct {
+			VideoURL string `json:"video_url"`
+			Streams  struct {
+				Main    string `json:"main"`
+				Preview string `json:"preview"`
+				HEVC    string `json:"hevc"`
+			} `json:"streams"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &reply); err != nil || reply.Status != 1 {
+		return nil
+	}
+	referer := strings.TrimRight(base, "/") + "/"
+	var options []providerMedia
+	seen := map[string]bool{}
+	add := func(raw, codec string) {
+		address := normalizeProviderMediaURL(referer, raw)
+		if !isProviderHTTPMediaURL(address) || seen[address] {
+			return
+		}
+		seen[address] = true
+		options = append(options, providerMedia{URL: address, Referer: referer, Codec: codec})
+	}
+	add(reply.Data.Streams.Main, "")
+	add(reply.Data.Streams.Preview, "")
+	add(reply.Data.Streams.HEVC, "hevc")
+	add(reply.Data.VideoURL, "")
+	return options
+}
+
+func huangguoAIPlaybackURL(base string, data []byte) string {
+	options := huangguoAIPlaybackOptions(base, data)
+	if len(options) == 0 {
+		return ""
+	}
+	return options[0].URL
+}
+
+func (d *Downloader) fetchHuangguoAIMedia(ctx context.Context, sourceID string, episode int) (providerMedia, error) {
 	if !rankingSourceID.MatchString(sourceID) || episode < 1 {
-		return "", errors.New("黄果集数无效")
+		return providerMedia{}, errors.New("黄果集数无效")
+	}
+	base := d.providerBaseURL(sourceHuangguoAI)
+	referer := strings.TrimRight(base, "/") + "/"
+	playbackPath := fmt.Sprintf("/api/videos/%s/episodes/%d/playback", url.PathEscape(sourceID), episode)
+	if d.huangguoEdgeMode(base) == "v1" {
+		if body, err := d.huangguoEdgeCall(ctx, base, http.MethodPost, playbackPath); err == nil {
+			if options := huangguoAIPlaybackOptions(base, body); len(options) > 0 {
+				media := options[0]
+				if len(options) > 1 {
+					media.Variants = options
+				}
+				return media, nil
+			}
+		} else if !huangguoShouldUseEdgeV1(err) {
+			return providerMedia{}, err
+		}
 	}
 	var play struct {
 		VideoURL string `json:"video_url"`
 	}
 	path := fmt.Sprintf("/api/videos/%s/play?ep=%d&page_texts=0", url.PathEscape(sourceID), episode)
 	if err := d.huangguoAIAPI(ctx, path, &play); err != nil {
+		return providerMedia{}, err
+	}
+	if mediaURL := normalizeProviderMediaURL(referer, play.VideoURL); mediaURL != "" {
+		return providerMedia{URL: mediaURL, Referer: referer}, nil
+	}
+	if d.huangguoEdgeMode(base) != "off" {
+		if body, err := d.huangguoEdgeCall(ctx, base, http.MethodPost, playbackPath); err == nil {
+			if options := huangguoAIPlaybackOptions(base, body); len(options) > 0 {
+				d.setHuangguoEdgeMode(base, "v1")
+				media := options[0]
+				if len(options) > 1 {
+					media.Variants = options
+				}
+				return media, nil
+			}
+		}
+	}
+	return providerMedia{Referer: referer}, nil
+}
+
+func (d *Downloader) fetchHuangguoAIPlayURL(ctx context.Context, sourceID string, episode int) (string, error) {
+	media, err := d.fetchHuangguoAIMedia(ctx, sourceID, episode)
+	if err != nil {
 		return "", err
 	}
-	return normalizeProviderMediaURL(d.providerBaseURL(sourceHuangguoAI)+"/", play.VideoURL), nil
+	return media.URL, nil
 }
 
 func (d *Downloader) searchHuangguoAI(ctx context.Context, page int, query string) ([]Drama, bool, error) {

@@ -38,13 +38,13 @@ var allKnownSources = []sourceSiteInfo{
 	{ID: "hanxiaoquan", Name: "韩小圈", Description: "韩剧 · 韩国电影 · 综艺动漫", GroupID: "hanxiaoquan", GroupName: "韩小圈", EntryName: "韩小圈", Restricted: false, OnlineSearch: true},
 	{ID: "guipian", Name: "鬼片", Description: "鬼片 · 电视剧 · 动漫", GroupID: "guipian", GroupName: "鬼片", EntryName: "鬼片", Restricted: false, OnlineSearch: true},
 	{ID: "sorani", Name: "青空", Description: "番剧 · 剧场动画 · 特摄", GroupID: "sorani", GroupName: "青空", EntryName: "青空", Restricted: false, OnlineSearch: true},
-	{ID: "huangdou", Name: "黄豆", Description: "精选短剧", GroupID: "huangdou", GroupName: "黄豆", EntryName: "黄豆", Restricted: true, OnlineSearch: false},
-	{ID: "huangju", Name: "剧果", Description: "热门 · 最新 · 分类短剧", GroupID: "huangju", GroupName: "剧果", EntryName: "剧果", Restricted: true, OnlineSearch: true},
-	{ID: "yeguo", Name: "野果", Description: "分类短剧 · 在线搜索", GroupID: "yeguo", GroupName: "野果", EntryName: "野果", Restricted: true, OnlineSearch: true},
-	{ID: "dsd", Name: "帝果", Description: "分类视频 · 在线搜索", GroupID: "dsd", GroupName: "帝果", EntryName: "帝果", Restricted: true, OnlineSearch: true},
-	{ID: "huangguo-video", Name: "黄果视频", Description: "视频剧集", GroupID: "huangguo", GroupName: "黄果", EntryName: "视频", Restricted: true, OnlineSearch: false},
-	{ID: "huangguoai", Name: "黄果 AI", Description: "AI 短剧", GroupID: "huangguo", GroupName: "黄果", EntryName: "AI", Restricted: true, OnlineSearch: true},
-	{ID: "cloudfront", Name: "黄果旧版", Description: "旧 API 剧库", GroupID: "huangguo", GroupName: "黄果", EntryName: "旧版", Restricted: true, OnlineSearch: false},
+	{ID: "huangdou", Name: "黄豆", Description: "精选短剧", GroupID: "huangdou", GroupName: "黄豆", EntryName: "黄豆", Restricted: false, OnlineSearch: false},
+	{ID: "huangju", Name: "剧果", Description: "热门 · 最新 · 分类短剧", GroupID: "huangju", GroupName: "剧果", EntryName: "剧果", Restricted: false, OnlineSearch: true},
+	{ID: "yeguo", Name: "野果", Description: "分类短剧 · 在线搜索", GroupID: "yeguo", GroupName: "野果", EntryName: "野果", Restricted: false, OnlineSearch: true},
+	{ID: "dsd", Name: "帝果", Description: "分类视频 · 在线搜索", GroupID: "dsd", GroupName: "帝果", EntryName: "帝果", Restricted: false, OnlineSearch: true},
+	{ID: "huangguo-video", Name: "黄果视频", Description: "视频剧集", GroupID: "huangguo", GroupName: "黄果", EntryName: "视频", Restricted: false, OnlineSearch: false},
+	{ID: "huangguoai", Name: "黄果 AI", Description: "AI 短剧", GroupID: "huangguo", GroupName: "黄果", EntryName: "AI", Restricted: false, OnlineSearch: true},
+	{ID: "cloudfront", Name: "黄果旧版", Description: "旧 API 剧库", GroupID: "huangguo", GroupName: "黄果", EntryName: "旧版", Restricted: false, OnlineSearch: false},
 }
 
 func availableSourceSites() []sourceSiteInfo {

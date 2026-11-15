@@ -96,6 +96,12 @@ func selectHongguoAppMedia(model map[string]any) (providerMedia, error) {
 			height = width
 		}
 		media.Quality = height
+		switch codec {
+		case "h264", "avc1", "avc3":
+			media.Codec = "h264"
+		case "bytevc1", "hevc", "h265", "hvc1", "hev1":
+			media.Codec = "hevc"
+		}
 		quality := height * 10
 		if codec == "h264" || codec == "avc1" {
 			quality++

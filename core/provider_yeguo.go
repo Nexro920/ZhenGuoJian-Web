@@ -303,6 +303,11 @@ func (d *Downloader) resolveYeguoMedia(ctx context.Context, task Task) (provider
 		}
 		seen[address] = true
 		media := providerMedia{URL: address, Referer: referer, Quality: quality}
+		if field == "video_url_h265" {
+			media.Codec = "hevc"
+		} else {
+			media.Codec = "h264"
+		}
 		if duration, err := strconv.ParseFloat(mapString(row, "episode_duration"), 64); err == nil && duration > 0 && duration <= 604800 {
 			media.Duration = time.Duration(duration * float64(time.Second))
 		}

@@ -11,5 +11,8 @@
 *.json text eol=lf
 *.svg text eol=lf
 *.md text eol=lf
+*.bat text eol=crlf
 VERSION text eol=lf
 *.png binary
+*.exe binary
+*.dll binary

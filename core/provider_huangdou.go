@@ -9,6 +9,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -233,13 +234,17 @@ func (c *huangdouAPIClient) callOnce(ctx context.Context, path string, data map[
 	req.Header.Set("deviceType", huangdouDeviceType)
 	req.Header.Set("requestId", rid)
 	req.Header.Set("sessionId", c.sessionID)
-	resp, err := c.d.doPreparedCatalogRequest(req, 20*time.Second, func(prepared *http.Request) {
+	prepareReq := func(prepared *http.Request) {
 		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 		signRaw := "Dart|" + c.sessionID + "|" + rid + "|" + timestamp + "|" + path
 		signSum := sha256.Sum256([]byte(signRaw))
 		prepared.Header.Set("time", timestamp)
 		prepared.Header.Set("sign", hex.EncodeToString(signSum[:])+"-"+timestamp)
-	})
+	}
+	resp, err := c.d.doPreparedCatalogRequest(req, 20*time.Second, prepareReq)
+	if err != nil && isHuangdouCertError(req.URL.Hostname(), err) {
+		resp, err = c.callInsecureTLS(req, body, 20*time.Second, prepareReq)
+	}
 	if err != nil {
 		return err
 	}
@@ -422,4 +427,55 @@ func uuidLike() string {
 		return raw
 	}
 	return raw[:8] + "-" + raw[8:12] + "-" + raw[12:16] + "-" + raw[16:20] + "-" + raw[20:]
+}
+
+func isHuangdouCertError(host string, err error) bool {
+	if err == nil {
+		return false
+	}
+	lowerHost := strings.ToLower(strings.TrimSpace(host))
+	if lowerHost != "xqjurgek.top" && lowerHost != "tideember.cc" {
+		return false
+	}
+	var certErr x509.CertificateInvalidError
+	var unknownErr x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	if errors.As(err, &certErr) || errors.As(err, &unknownErr) || errors.As(err, &hostErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "certificate has expired") ||
+		strings.Contains(msg, "failed to verify certificate") ||
+		strings.Contains(msg, "x509:")
+}
+
+func (c *huangdouAPIClient) callInsecureTLS(origReq *http.Request, body []byte, timeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(origReq.Context(), timeout)
+	req, err := http.NewRequestWithContext(ctx, origReq.Method, origReq.URL.String(), bytes.NewReader(body))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header = origReq.Header.Clone()
+	if prepare != nil {
+		prepare(req)
+	}
+	resp, err := c.d.huangdouInsecureHTTPClient(nil).Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = &huangdouCancelBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+type huangdouCancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *huangdouCancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }

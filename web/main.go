@@ -133,9 +133,35 @@ func defaultListenAddress() string {
 	return "0.0.0.0:7080"
 }
 
+func resolveProjectRoot() string {
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		if _, err := os.Stat(filepath.Join(wd, "go.mod")); err == nil {
+			return wd
+		}
+	}
+	if exePath, err := os.Executable(); err == nil && exePath != "" {
+		exeDir := filepath.Dir(exePath)
+		tempDir := filepath.Clean(os.TempDir())
+		cleanExeDir := filepath.Clean(exeDir)
+		if !strings.HasPrefix(strings.ToLower(cleanExeDir), strings.ToLower(tempDir)) {
+			if strings.EqualFold(filepath.Base(cleanExeDir), "dist") {
+				parent := filepath.Dir(cleanExeDir)
+				if _, err := os.Stat(filepath.Join(parent, "go.mod")); err == nil {
+					return parent
+				}
+			}
+			return cleanExeDir
+		}
+	}
+	return ""
+}
+
 func defaultDataDirectory() string {
 	if v := strings.TrimSpace(os.Getenv("ZGJ_DATA_DIR")); v != "" {
 		return v
+	}
+	if root := resolveProjectRoot(); root != "" {
+		return filepath.Join(root, "data")
 	}
 	folder := "hongguojian-web"
 	if core.AllSourcesEnabled() {
@@ -153,6 +179,66 @@ func defaultDataDirectory() string {
 func envBoolFlag(key string) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	return v == "1" || v == "true" || v == "yes"
+}
+
+func defaultAutoOpen() bool {
+	if v := strings.TrimSpace(os.Getenv("ZGJ_OPEN")); v != "" {
+		return envBoolFlag("ZGJ_OPEN")
+	}
+	if envBoolFlag("ZGJ_NO_OPEN") {
+		return false
+	}
+	return true
+}
+
+func probeExistingInstance(listenAddr string) (string, bool) {
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil || port == "" {
+		return "", false
+	}
+	targetURL := fmt.Sprintf("http://127.0.0.1:%s", port)
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Get(targetURL + "/api/bootstrap")
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	var env struct {
+		OK      bool   `json:"ok"`
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil || !env.OK || env.Version == "" {
+		return "", false
+	}
+	return targetURL, true
+}
+
+func listenWithFallback(listenAddr string, allowFallback bool) (net.Listener, string, error) {
+	listener, err := net.Listen("tcp", listenAddr)
+	if err == nil {
+		return listener, listenAddr, nil
+	}
+	if !allowFallback {
+		return nil, listenAddr, err
+	}
+	host, portStr, splitErr := net.SplitHostPort(listenAddr)
+	if splitErr != nil {
+		return nil, listenAddr, err
+	}
+	var basePort int
+	if _, scanErr := fmt.Sscanf(portStr, "%d", &basePort); scanErr != nil || basePort <= 0 {
+		return nil, listenAddr, err
+	}
+	for offset := 1; offset <= 20; offset++ {
+		candidate := net.JoinHostPort(host, fmt.Sprintf("%d", basePort+offset))
+		if l, lErr := net.Listen("tcp", candidate); lErr == nil {
+			return l, candidate, nil
+		}
+	}
+	return nil, listenAddr, err
 }
 
 func openBrowserURL(targetURL string) {
@@ -183,8 +269,23 @@ func main() {
 	flag.StringVar(&downloadsDir, "downloads-dir", strings.TrimSpace(os.Getenv("ZGJ_DOWNLOADS_DIR")), "视频离线下载保存目录（默认位于 data-dir/downloads）")
 	flag.StringVar(&uiDir, "ui-dir", strings.TrimSpace(os.Getenv("ZGJ_UI_DIR")), "前端静态资源覆盖目录（开发调试用）")
 	flag.BoolVar(&disableImages, "disable-images", envBoolFlag("DISABLE_REMOTE_IMAGES"), "禁用远程站源海报加载并返回合成占位图")
-	flag.BoolVar(&autoOpen, "open", false, "启动后自动在默认浏览器打开网页")
+	flag.BoolVar(&autoOpen, "open", defaultAutoOpen(), "启动后自动在默认浏览器打开网页")
 	flag.Parse()
+
+	listenExplicit := strings.TrimSpace(os.Getenv("ZGJ_LISTEN")) != "" || strings.TrimSpace(os.Getenv("PORT")) != ""
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "listen" {
+			listenExplicit = true
+		}
+	})
+
+	if existingURL, ok := probeExistingInstance(listenAddr); ok {
+		fmt.Printf("检测到 %s 网页版已在运行: %s\n", appDisplayName(), existingURL)
+		if autoOpen {
+			openBrowserURL(existingURL)
+		}
+		return
+	}
 
 	absDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
@@ -253,13 +354,16 @@ func main() {
 
 	appServer := newWebAppServer(appVersion, disableImages, absUIDir, tempRoot, store, diary)
 
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, actualListenAddr, err := listenWithFallback(listenAddr, !listenExplicit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "监听地址 %s 失败: %v\n", listenAddr, err)
 		core.ShutdownEngine()
 		os.Exit(1)
 	}
 	actualPort := listener.Addr().(*net.TCPAddr).Port
+	if actualListenAddr != listenAddr {
+		fmt.Printf("提示: 地址 %s 已被占用，已自动切换至 %s\n", listenAddr, actualListenAddr)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

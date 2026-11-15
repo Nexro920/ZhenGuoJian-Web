@@ -115,6 +115,9 @@ func soraniDramaFromMap(row map[string]any) (Drama, error) {
 	if score != "" {
 		score = truncate(score, 16)
 	}
+	if levelText := mapString(row, "levelText", "accessText"); levelText != "" {
+		addTag(levelText)
+	}
 
 	if category == "" {
 		category = "番剧"
@@ -212,17 +215,36 @@ func (d *Downloader) fetchSoraniCatalogPage(ctx context.Context, page int, categ
 	case category != "":
 		values.Set("categoryId", category)
 	}
-	value, err := d.soraniRequest(ctx, route, values, 4<<20)
+	limit := int64(4 << 20)
+	if query != "" {
+		limit = 24 << 20
+	}
+	value, err := d.soraniRequest(ctx, route, values, limit)
 	if err != nil {
 		return nil, false, err
 	}
 	payload := soraniPayload(value)
 	rows, ok := soraniRecordList(payload)
-	if !ok || len(rows) > 500 {
+	maxRows := 500
+	if query != "" {
+		maxRows = 10000
+	}
+	if !ok || len(rows) > maxRows {
 		return nil, false, errors.New("青空次元目录数据格式无效")
 	}
 	hasMore := len(rows) >= pageSize
-	if meta, ok := payload.(map[string]any); ok {
+	if query != "" && len(rows) > pageSize {
+		start := (page - 1) * pageSize
+		if start >= len(rows) {
+			return []Drama{}, false, nil
+		}
+		end := start + pageSize
+		hasMore = end < len(rows)
+		if end > len(rows) {
+			end = len(rows)
+		}
+		rows = rows[start:end]
+	} else if meta, ok := payload.(map[string]any); ok {
 		if total, err := strconv.Atoi(nativeText(meta["total"])); err == nil && total >= 0 && total <= 100000000 {
 			hasMore = page*pageSize < total
 		}
@@ -333,8 +355,25 @@ func (d *Downloader) resolveSoraniMedia(ctx context.Context, task Task) (provide
 		return providerMedia{}, err
 	}
 	row, _ := soraniPayload(value).(map[string]any)
+	if canPlay, ok := row["canPlay"].(bool); ok && !canPlay {
+		return providerMedia{}, fmt.Errorf("青空次元该分集暂不可播（%s）", firstNonEmpty(mapString(row, "message", "msg"), "需要登录或源站授权"))
+	}
 	address := mapString(row, "playUrl", "url")
 	if address == "" {
+		if fallbackVal, fallbackErr := d.soraniRequest(ctx, "/video/episode/"+url.PathEscape(episodeID)+"/play", url.Values{}, 64<<10); fallbackErr == nil {
+			if fallbackRow, _ := soraniPayload(fallbackVal).(map[string]any); fallbackRow != nil {
+				row = fallbackRow
+				if canPlay, ok := row["canPlay"].(bool); ok && !canPlay {
+					return providerMedia{}, fmt.Errorf("青空次元该分集暂不可播（%s）", firstNonEmpty(mapString(row, "message", "msg"), "需要登录或源站授权"))
+				}
+				address = mapString(row, "playUrl", "url")
+			}
+		}
+	}
+	if address == "" {
+		if msg := mapString(row, "message", "msg"); msg != "" {
+			return providerMedia{}, fmt.Errorf("青空次元该分集暂不可播：%s", msg)
+		}
 		return providerMedia{}, fmt.Errorf("青空次元该分集暂无可用播放地址（线路 %s）", lineCode)
 	}
 	media := providerMedia{URL: address, Referer: soraniSiteBaseURL + "/"}

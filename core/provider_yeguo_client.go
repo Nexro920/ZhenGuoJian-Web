@@ -36,7 +36,8 @@ const (
 var (
 	errYeguoDecode        = errors.New("野果接口响应校验或解码失败")
 	yeguoModuleImport     = regexp.MustCompile(`(?s)import\s*\{([^{};]+)\}\s*from\s*["'\x60]([^"'\x60]+)["'\x60]`)
-	yeguoScriptBaseCall   = regexp.MustCompile(`baseURL:([a-zA-Z_$][a-zA-Z0-9_$]*)\(\)`)
+	yeguoScriptBaseCall   = regexp.MustCompile(`baseURL:([a-zA-Z_$][a-zA-Z0-9_$]*)\([^)]*\)`)
+	yeguoScriptArrowCall  = regexp.MustCompile(`([a-zA-Z_$][a-zA-Z0-9_$]*)\(\)`)
 	yeguoPublicField      = regexp.MustCompile(`\b(version|mode|padding|key|iv|sign_key)\s*:\s*(?:[a-zA-Z_$][a-zA-Z0-9_$]*\(\s*)?["'\x60]([^"'\x60\\\r\n]{1,512})["'\x60]`)
 	yeguoTransitBase64    = regexp.MustCompile(`Base64\.decode\(["']([A-Za-z0-9+/=]{128,})["']\)`)
 	yeguoTransitSuffix    = regexp.MustCompile(`(?i)\+\s*["']\.([a-z0-9-]+(?:\.[a-z0-9-]+)+)["']`)
@@ -342,14 +343,52 @@ func yeguoValidAPIBase(base string) (string, error) {
 	return strings.TrimRight(base, "/"), nil
 }
 
+func yeguoScriptArrowURL(script, name string) string {
+	pattern, err := regexp.Compile(`(?:^|[^a-zA-Z0-9_$.])` + regexp.QuoteMeta(name) + `=\(\)=>["'\x60](https?://[^"'\x60\s]{1,512})["'\x60]`)
+	if err != nil {
+		return ""
+	}
+	if match := pattern.FindStringSubmatch(script); match != nil {
+		if base, err := yeguoValidAPIBase(match[1]); err == nil {
+			return base
+		}
+	}
+	return ""
+}
+
 func yeguoScriptAPIBase(script string) string {
+	return yeguoScriptAPIBaseForSite(script, "")
+}
+
+func yeguoScriptAPIBaseForSite(script, site string) string {
 	for _, call := range yeguoScriptBaseCall.FindAllStringSubmatch(script, 16) {
-		pattern, err := regexp.Compile(`(?:^|[^a-zA-Z0-9_$.])` + regexp.QuoteMeta(call[1]) + `=\(\)=>["'\x60](https?://[^"'\x60\s]{1,512})["'\x60]`)
+		name := call[1]
+		if base := yeguoScriptArrowURL(script, name); base != "" {
+			return base
+		}
+		defPattern, err := regexp.Compile(`(?:^|[^a-zA-Z0-9_$.])` + regexp.QuoteMeta(name) + `=\([^)]*\)=>`)
 		if err != nil {
 			continue
 		}
-		if match := pattern.FindStringSubmatch(script); match != nil {
-			if base, err := yeguoValidAPIBase(match[1]); err == nil {
+		loc := defPattern.FindStringIndex(script)
+		if loc == nil {
+			continue
+		}
+		end := loc[1] + 450
+		if end > len(script) {
+			end = len(script)
+		}
+		snippet := script[loc[1]:end]
+		if !strings.Contains(snippet, "/api.php") {
+			continue
+		}
+		if site != "" && strings.Contains(snippet, "${") {
+			if base, err := yeguoValidAPIBase(strings.TrimRight(site, "/") + "/api.php"); err == nil {
+				return base
+			}
+		}
+		for _, helper := range yeguoScriptArrowCall.FindAllStringSubmatch(snippet, 8) {
+			if base := yeguoScriptArrowURL(script, helper[1]); base != "" {
 				return base
 			}
 		}
@@ -460,15 +499,15 @@ func (client *yeguoAPIClient) discoverConfigurationAt(ctx context.Context, site 
 		return nil, err
 	}
 	if apiBase == "" {
-		apiBase = yeguoScriptAPIBase(entryBody)
+		apiBase = yeguoScriptAPIBaseForSite(entryBody, site)
 	}
+	access := parseYeguoPublicConfiguration(entryBody)
 	imports := yeguoModuleImport.FindAllStringSubmatch(entryBody, 64)
 	sort.SliceStable(imports, func(i, j int) bool {
 		return !strings.Contains(imports[i][1], ",") && strings.Contains(imports[j][1], ",")
 	})
 	seen := map[string]bool{}
 	var lastErr error
-	var access *yeguoAccess
 	for _, imported := range imports {
 		if access != nil && apiBase != "" {
 			break
@@ -494,7 +533,7 @@ func (client *yeguoAPIClient) discoverConfigurationAt(ctx context.Context, site 
 			continue
 		}
 		if apiBase == "" {
-			apiBase = yeguoScriptAPIBase(body)
+			apiBase = yeguoScriptAPIBaseForSite(body, site)
 		}
 		if access == nil {
 			access = parseYeguoPublicConfiguration(body)

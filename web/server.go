@@ -767,45 +767,7 @@ func (srv *webAppServer) handleStream(writer http.ResponseWriter, request *http.
 	upstreamURL := origin + "/" + streamToken + "/" + assetName
 
 	if request.URL.Query().Get("transcode") == "h264" {
-		ffmpeg := findFFmpegBinary()
-		if ffmpeg == "" {
-			http.Error(writer, "当前环境未安装 FFmpeg，无法进行实时兼容转码", http.StatusNotImplemented)
-			return
-		}
-		writer.Header().Set("Content-Type", "video/mp4")
-		writer.Header().Set("Cache-Control", "no-store")
-		if request.Method == http.MethodHead {
-			writer.WriteHeader(http.StatusOK)
-			return
-		}
-		var args []string
-		args = append(args, "-v", "error")
-		if key := srv.cenc.keyForToken(streamToken); len(key) == 16 {
-			args = append(args, "-decryption_key", hex.EncodeToString(key))
-		}
-		if strings.HasSuffix(strings.ToLower(assetName), ".m3u8") {
-			args = append(args, "-allowed_extensions", "ALL", "-extension_picky", "0")
-		}
-		if startSec, sErr := strconv.ParseFloat(request.URL.Query().Get("start"), 64); sErr == nil && startSec > 0.5 {
-			args = append(args, "-ss", fmt.Sprintf("%.2f", startSec))
-		}
-		args = append(args,
-			"-i", upstreamURL,
-			"-map", "0:v:0",
-			"-map", "0:a:0?",
-			"-c:v", "libx264",
-			"-preset", "ultrafast",
-			"-crf", "23",
-			"-pix_fmt", "yuv420p",
-			"-c:a", "aac",
-			"-b:a", "128k",
-			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
-			"-f", "mp4",
-			"pipe:1",
-		)
-		cmd := exec.CommandContext(request.Context(), ffmpeg, args...)
-		cmd.Stdout = writer
-		_ = cmd.Run()
+		srv.serveH264Transcode(writer, request, upstreamURL, srv.cenc.keyForToken(streamToken), request.URL.Query().Get("start"), strings.HasSuffix(strings.ToLower(assetName), ".m3u8"))
 		return
 	}
 
@@ -885,6 +847,61 @@ func (srv *webAppServer) handleStream(writer http.ResponseWriter, request *http.
 	}
 }
 
+func (srv *webAppServer) serveH264Transcode(writer http.ResponseWriter, request *http.Request, inputSource string, decryptionKey []byte, startRaw string, isHLS bool) {
+	ffmpeg := findFFmpegBinary()
+	if ffmpeg == "" {
+		http.Error(writer, "当前环境未安装 FFmpeg，无法进行实时兼容转码", http.StatusNotImplemented)
+		return
+	}
+	writer.Header().Set("Content-Type", "video/mp4")
+	writer.Header().Set("Cache-Control", "no-store")
+	if request.Method == http.MethodHead {
+		writer.WriteHeader(http.StatusOK)
+		return
+	}
+	args := []string{"-v", "error"}
+	if len(decryptionKey) == 16 {
+		args = append(args, "-decryption_key", hex.EncodeToString(decryptionKey))
+	}
+	if isHLS {
+		args = append(args, "-allowed_extensions", "ALL", "-extension_picky", "0")
+	}
+	if startSec, sErr := strconv.ParseFloat(startRaw, 64); sErr == nil && startSec > 0.5 {
+		args = append(args, "-ss", fmt.Sprintf("%.2f", startSec))
+	}
+	args = append(args,
+		"-i", inputSource,
+		"-map", "0:v:0",
+		"-map", "0:a:0?",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-crf", "23",
+		"-profile:v", "high",
+		"-level:v", "4.1",
+		"-pix_fmt", "yuv420p",
+		"-g", "48",
+		"-sc_threshold", "0",
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4",
+		"pipe:1",
+	)
+	var errBuf bytes.Buffer
+	cmd := exec.CommandContext(request.Context(), ffmpeg, args...)
+	cmd.Stdout = writer
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil && request.Context().Err() == nil {
+		msg := strings.TrimSpace(errBuf.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		if srv.diary != nil {
+			srv.diary.add("[转码] FFmpeg H.264 转码失败：" + msg)
+		}
+	}
+}
+
 func (srv *webAppServer) handleLocalMedia(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet && request.Method != http.MethodHead {
 		writer.WriteHeader(http.StatusMethodNotAllowed)
@@ -908,6 +925,10 @@ func (srv *webAppServer) handleLocalMedia(writer http.ResponseWriter, request *h
 	filePath, _, _, found, err := core.LocalEpisodeFile(dramaID, index)
 	if err != nil || !found || filePath == "" {
 		http.NotFound(writer, request)
+		return
+	}
+	if request.URL.Query().Get("transcode") == "h264" {
+		srv.serveH264Transcode(writer, request, filePath, nil, request.URL.Query().Get("start"), false)
 		return
 	}
 	f, err := os.Open(filePath)

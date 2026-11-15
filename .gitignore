@@ -1,9 +1,11 @@
 /dist/
 /build/
+/data/
 /zhenguojian-web
-/zhenguojian-web.exe
 *-data/
 *.exe
+!/zhenguojian-web.exe
+!/bin/*.exe
 *.out
 *.test
 *.prof

@@ -523,11 +523,11 @@
       this.exploreHasMore = false;
       this.exploreWarning = "";
       this.exploreError = "";
-      this._reloadExplore(false);
+      this._reloadExplore(false, { resetScroll: true });
     }
 
-    async _reloadExplore(force) {
-      await this._fetchExplorePage(1, !!force);
+    async _reloadExplore(force, opts) {
+      await this._fetchExplorePage(1, !!force, opts);
     }
 
     async _loadMoreExplore() {
@@ -535,31 +535,35 @@
       await this._fetchExplorePage(this.explorePage + 1, false);
     }
 
-    async _fetchExplorePage(page, force) {
+    async _fetchExplorePage(page, force, opts) {
       const src = this.exploreSource;
       if (!src) return;
+      const p = Number(page) > 0 ? Number(page) : 1;
+      const appendMode = p > 1 && this.exploreItems.length > 0;
       const epoch = ++this.exploreEpoch;
       this.exploreLoading = true;
       this.exploreError = "";
-      if (page === 1 && !force && this.exploreTabId !== "app:recommend" && !this.exploreTabId.startsWith("app:rank:")) {
+      if (p === 1 && !force && this.exploreTabId !== "app:recommend" && !this.exploreTabId.startsWith("app:rank:")) {
         try {
           const catParam = this.exploreTabId.startsWith("local:") ? "" : this.exploreTabId;
           const cached = await API.rpc("cached", { source: src, category: catParam });
           if (epoch === this.exploreEpoch && cached && Array.isArray(cached.items) && cached.items.length > 0 && this.exploreItems.length === 0) {
             this.exploreItems = this._filterLocalCat(cached.items.map(normalizeDrama));
-            this.render();
+            this.render(opts);
           }
         } catch (_) {}
-      } else if (page === 1 && !force && this.exploreTabId === "app:recommend") {
+      } else if (p === 1 && !force && this.exploreTabId === "app:recommend") {
         try {
           const cachedRec = await API.rpc("cachedRecommendations", { category: "find_drama" });
           if (epoch === this.exploreEpoch && cachedRec && Array.isArray(cachedRec.items) && cachedRec.items.length > 0 && this.exploreItems.length === 0) {
             this.exploreItems = cachedRec.items.map(normalizeDrama);
-            this.render();
+            this.render(opts);
           }
         } catch (_) {}
       }
-      this.render();
+      if (!appendMode || !this._updateGridPaginationDOM("explore", false)) {
+        this.render(opts);
+      }
 
       try {
         let res = null;
@@ -624,7 +628,9 @@
       } finally {
         if (epoch === this.exploreEpoch) {
           this.exploreLoading = false;
-          this.render();
+          if (!appendMode || this.exploreError || this.exploreWarning || !this._updateGridPaginationDOM("explore", true)) {
+            this.render();
+          }
         }
       }
     }
@@ -666,12 +672,16 @@
         return;
       }
       const p = Number(page) > 0 ? Number(page) : 1;
+      if (p > 1 && this.searchLoading) return;
+      const appendMode = p > 1 && this.searchItems.length > 0;
       this.searchSubmitted = true;
       this.searchSuggestions = [];
       this.searchLoading = true;
       this.searchWarning = "";
       if (p === 1) this.searchItems = [];
-      this.render();
+      if (!appendMode || !this._updateGridPaginationDOM("search", false)) {
+        this.render({ resetScroll: p === 1 });
+      }
 
       API.updateUserSettings({ rememberSearch: q })
         .then((res) => {
@@ -712,7 +722,9 @@
       } finally {
         if (epoch === this.searchEpoch) {
           this.searchLoading = false;
-          this.render();
+          if (!appendMode || this.searchWarning || !this._updateGridPaginationDOM("search", true)) {
+            this.render();
+          }
         }
       }
     }
@@ -1510,14 +1522,23 @@
       }
     }
 
-    render() {
+    render(opts) {
       const appRoot = document.getElementById("app");
       if (!this.state) return;
 
       if (this.state.locked) {
+        this._renderedView = "locked";
         this._renderLockScreen(appRoot);
         return;
       }
+
+      const prevScroll = appRoot.querySelector("#page-scroll");
+      const sameView = this._renderedView === this.view;
+      const shouldKeepScroll = !!(prevScroll && sameView && !(opts && opts.resetScroll));
+      const savedScrollTop = shouldKeepScroll ? prevScroll.scrollTop : 0;
+      const savedScrollLeft = shouldKeepScroll ? prevScroll.scrollLeft : 0;
+      const prevChipRow = appRoot.querySelector(".chip-row");
+      const savedChipScrollLeft = (sameView && prevChipRow) ? prevChipRow.scrollLeft : 0;
 
       const layout = this.effectiveLayout();
       const updCount = this.followUpdateCount();
@@ -1655,8 +1676,19 @@
         </div>
       `;
 
+      const nextScroll = appRoot.querySelector("#page-scroll");
+      const nextChipRow = appRoot.querySelector(".chip-row");
+      if (nextScroll && shouldKeepScroll) {
+        nextScroll.scrollTop = savedScrollTop;
+        nextScroll.scrollLeft = savedScrollLeft;
+      }
+      if (nextChipRow && savedChipScrollLeft > 0) {
+        nextChipRow.scrollLeft = savedChipScrollLeft;
+      }
+      this._renderedView = this.view;
+
       this._bindShellEvents(appRoot);
-      this._bindViewEvents(appRoot.querySelector("#page-scroll"));
+      this._bindViewEvents(nextScroll);
       CoverHydrator.scan(appRoot);
     }
 
@@ -1812,6 +1844,29 @@
       }
     }
 
+    _exploreGridState() {
+      const isFirstTab = this.exploreTabs.length > 0 && this.exploreTabId === this.exploreTabs[0].id;
+      const resumeEntry = isFirstTab
+        ? (this.state.history || []).find((h) => h.drama && h.drama.source === this.exploreSource)
+        : null;
+      const featuredDrama = !resumeEntry && this.exploreTabId === "app:recommend" && this.exploreItems.length > 0
+        ? this.exploreItems[0]
+        : null;
+      const gridItems = featuredDrama ? this.exploreItems.slice(1) : this.exploreItems;
+      return { resumeEntry, featuredDrama, gridItems };
+    }
+
+    _loadMoreContentHtml(mode, gridCount) {
+      if (mode === "explore") {
+        if (this.exploreLoading) return `<span class="inline-spinner"></span>`;
+        if (this.exploreHasMore) return `<button class="btn" id="exp-more-btn" data-focusable>加载更多剧集</button>`;
+        return `<span style="font-size:12px;color:var(--text-muted);">已显示全部 ${gridCount} 部剧集</span>`;
+      }
+      if (this.searchLoading) return `<span class="inline-spinner"></span>`;
+      if (this.searchHasMore) return `<button class="btn" id="search-more-btn" data-focusable>加载下一页搜索结果</button>`;
+      return "";
+    }
+
     _renderExploreView() {
       if (!this.exploreSource) {
         return `<div class="empty-state"><div>当前用户未开启任何可用站源，请前往设置启用站源。</div></div>`;
@@ -1826,14 +1881,7 @@
         </div>
       `;
 
-      const isFirstTab = this.exploreTabs.length > 0 && this.exploreTabId === this.exploreTabs[0].id;
-      const resumeEntry = isFirstTab
-        ? (this.state.history || []).find((h) => h.drama && h.drama.source === this.exploreSource)
-        : null;
-      const featuredDrama = !resumeEntry && this.exploreTabId === "app:recommend" && this.exploreItems.length > 0
-        ? this.exploreItems[0]
-        : null;
-      const gridItems = featuredDrama ? this.exploreItems.slice(1) : this.exploreItems;
+      const { resumeEntry, featuredDrama, gridItems } = this._exploreGridState();
 
       let heroHtml = "";
       if (resumeEntry && resumeEntry.drama) {
@@ -1892,13 +1940,7 @@
                 ${gridItems.map((d) => this._renderDramaCard(d, { rank: this.exploreRanks.get(d.id) || 0 })).join("")}
               </div>
               <div class="load-more-row" id="exp-sentinel">
-                ${
-                  this.exploreLoading
-                    ? `<span class="inline-spinner"></span>`
-                    : this.exploreHasMore
-                    ? `<button class="btn" id="exp-more-btn" data-focusable>加载更多剧集</button>`
-                    : `<span style="font-size:12px;color:var(--text-muted);">已显示全部 ${gridItems.length} 部剧集</span>`
-                }
+                ${this._loadMoreContentHtml("explore", gridItems.length)}
               </div>
             `
         }
@@ -1949,14 +1991,8 @@
               <div class="drama-grid">
                 ${this.searchItems.map((d) => this._renderDramaCard(d, { showSource: true })).join("")}
               </div>
-              <div class="load-more-row">
-                ${
-                  this.searchLoading
-                    ? `<span class="inline-spinner"></span>`
-                    : this.searchHasMore
-                    ? `<button class="btn" id="search-more-btn" data-focusable>加载下一页搜索结果</button>`
-                    : ""
-                }
+              <div class="load-more-row" id="search-sentinel">
+                ${this._loadMoreContentHtml("search", this.searchItems.length)}
               </div>
             `
             : ""
@@ -2806,10 +2842,9 @@
       return null;
     }
 
-    _bindViewEvents(container) {
-      if (!container) return;
-
-      container.querySelectorAll("[data-card-id]").forEach((card) => {
+    _bindCardElements(root) {
+      if (!root) return;
+      root.querySelectorAll("[data-card-id]").forEach((card) => {
         card.onclick = () => {
           const id = card.getAttribute("data-card-id");
           if (this.view === "follows" && this.followBatchMode) {
@@ -2828,6 +2863,73 @@
           if (d) this.openDetail(d);
         };
       });
+    }
+
+    _bindScrollLoadMore(container) {
+      if (!container) return;
+      const expRetry = container.querySelector("#exp-retry-btn");
+      if (expRetry) expRetry.onclick = () => this._reloadExplore(true);
+      const expMore = container.querySelector("#exp-more-btn");
+      if (expMore) expMore.onclick = () => this._loadMoreExplore();
+      const searchMore = container.querySelector("#search-more-btn");
+      if (searchMore) searchMore.onclick = () => this.runSearch(this.searchQuery, this.searchPage + 1);
+
+      const loadNext =
+        this.view === "explore" && this.exploreHasMore && !this.exploreLoading
+          ? () => this._loadMoreExplore()
+          : this.view === "search" && this.searchHasMore && !this.searchLoading && this.searchItems.length > 0
+          ? () => this.runSearch(this.searchQuery, this.searchPage + 1)
+          : null;
+      container.onscroll = loadNext
+        ? () => {
+            if (container.scrollTop + container.clientHeight >= container.scrollHeight - 280) {
+              loadNext();
+            }
+          }
+        : null;
+    }
+
+    _updateGridPaginationDOM(mode, appendNew) {
+      if (this.view !== mode) return false;
+      const container = document.getElementById("page-scroll");
+      if (!container) return false;
+      const grid = container.querySelector(".drama-grid");
+      const sentinel = container.querySelector(mode === "explore" ? "#exp-sentinel" : "#search-sentinel");
+      if (!grid || !sentinel) return false;
+
+      const targetItems = mode === "explore" ? this._exploreGridState().gridItems : this.searchItems;
+      if (appendNew) {
+        const existingCards = [...grid.querySelectorAll("[data-card-id]")];
+        if (existingCards.length === 0 || targetItems.length < existingCards.length) return false;
+        for (let i = 0; i < existingCards.length; i++) {
+          if (existingCards[i].getAttribute("data-card-id") !== targetItems[i].id) return false;
+        }
+        const toAppend = targetItems.slice(existingCards.length);
+        if (toAppend.length > 0) {
+          const frag = document.createElement("div");
+          frag.innerHTML = toAppend
+            .map((d) =>
+              this._renderDramaCard(
+                d,
+                mode === "explore" ? { rank: this.exploreRanks.get(d.id) || 0 } : { showSource: true }
+              )
+            )
+            .join("");
+          this._bindCardElements(frag);
+          grid.append(...frag.children);
+          CoverHydrator.scan(grid);
+        }
+      }
+
+      sentinel.innerHTML = this._loadMoreContentHtml(mode, targetItems.length);
+      this._bindScrollLoadMore(container);
+      return true;
+    }
+
+    _bindViewEvents(container) {
+      if (!container) return;
+
+      this._bindCardElements(container);
 
       container.querySelectorAll("[data-hero-id]").forEach((hero) => {
         const trigger = () => {
@@ -2846,20 +2948,7 @@
       container.querySelectorAll("[data-exp-tab]").forEach((b) => {
         b.onclick = () => this.selectExploreTab(b.getAttribute("data-exp-tab"));
       });
-      const expRetry = container.querySelector("#exp-retry-btn");
-      if (expRetry) expRetry.onclick = () => this._reloadExplore(true);
-      const expMore = container.querySelector("#exp-more-btn");
-      if (expMore) expMore.onclick = () => this._loadMoreExplore();
-
-      if (this.view === "explore" && this.exploreHasMore && !this.exploreLoading) {
-        container.onscroll = () => {
-          if (container.scrollTop + container.clientHeight >= container.scrollHeight - 280) {
-            this._loadMoreExplore();
-          }
-        };
-      } else {
-        container.onscroll = null;
-      }
+      this._bindScrollLoadMore(container);
 
       const searchForm = container.querySelector("#search-form");
       const searchInp = container.querySelector("#search-input");
@@ -2909,8 +2998,6 @@
           if (res.state) this.setState(res.state);
         };
       }
-      const searchMore = container.querySelector("#search-more-btn");
-      if (searchMore) searchMore.onclick = () => this.runSearch(this.searchQuery, this.searchPage + 1);
 
       const folCheck = container.querySelector("#fol-check-btn");
       if (folCheck) {

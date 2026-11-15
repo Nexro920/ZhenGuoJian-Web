@@ -71,6 +71,12 @@ type Downloader struct {
 	legacy                *legacyAPIClient
 	previewMu             sync.Mutex
 	previewSessions       map[string]*huangguoPreviewSession
+	edgeMu                sync.Mutex
+	edgeSessions          map[string]*huangguoEdgeSession
+	edgePending           map[string]*huangguoEdgeSessionCall
+	edgeModes             map[string]string
+	huangdouClientOnce    sync.Once
+	huangdouInsecure      *http.Client
 }
 
 func defaultConfig() Config { return Config{MaxPagesPerSort: 50, PageSize: 30, Retries: 2} }
@@ -140,6 +146,8 @@ type nativePlan struct {
 	URL             string            `json:"url"`
 	Headers         map[string]string `json:"headers"`
 	Key             string            `json:"decryptionKey,omitempty"`
+	Codec           string            `json:"codec,omitempty"`
+	Duration        float64           `json:"duration,omitempty"`
 	Quality         int               `json:"quality"`
 	Qualities       []int             `json:"qualities"`
 	Session         string            `json:"session,omitempty"`
