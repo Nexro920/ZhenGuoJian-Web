@@ -9,17 +9,17 @@
 - **`core/`（站源与核心引擎，单包 `duanjuapp/native/core`）**
   - `app_runtime.go`：统一 JSON 分派入口 `NativeRequest(json) -> json`，管理单例 `nativeState.engine`。
   - `web_bridge.go`：向 `web/` 暴露的进程内桥接函数（`LoadCoverFile`、`PrepareHEICCover`、`ExtractHEICWebFrame`、`CompletedDownloadFile`、`LocalEpisodeFile`、`ShutdownEngine`）。
-  - `provider_*.go`：11 个内置站源的请求、签名、目录解析与取流（**Go `regexp` 基于 RE2，不支持 `(?=...)` 等前瞻语法**，多线路截断须用显式字符串定位）。
+  - `provider_*.go`：11 个内置站源的请求、签名、目录解析与取流（含 `provider_huangguo_edge.go` 实现 `dx150-edge-v1` 边缘协议会话加解密；**Go `regexp` 基于 RE2，不支持 `(?=...)` 等前瞻语法**，多线路截断须用显式字符串定位）。
   - `app_stream.go` / `app_downloads.go`：核心内部回环流代理与分集下载调度。
   - 新增站源需同步接入：`provider_huangguo.go`、`provider_media.go`、`app_categories.go`、`app_cover_metadata.go`、`app_runtime.go` 及 `web/store.go`（`allKnownSources`）。
 - **`web/`（HTTP 服务端、实时解密重封装与多用户存储，`package main`）**
-  - `main.go`：CLI 参数解析、核心初始化（`action: "initialize"`）、生命周期信号监听与优雅退出。
-  - `server.go`：HTTP 路由（`/api/*` 与内嵌静态资源）、流会话管理、预加载缓存、静态资源热覆盖（`-ui-dir`）。
-  - `cenc.go` / `hls_mux.go` / `converter.go`：纯 Go ISO/IEC 23001-7 `cenc-aes-ctr` MP4 HTTP Range 实时流解密（含 `moov` 预热与首段明文缓存）、HLS 同源重写与伪装 `.ts` 头剥离、离线下载转封装标准 MP4。
+  - `main.go`：CLI 参数解析、单实例探测（`probeExistingInstance`）与端口自动顺延回退（`listenWithFallback`）、默认同级 `data/` 目录定位（`defaultDataDirectory`）、默认自动打开浏览器（`defaultAutoOpen`，支持 `ZGJ_OPEN`/`ZGJ_NO_OPEN`）、核心初始化（`action: "initialize"`）与优雅退出。
+  - `server.go`：HTTP 路由（`/api/*` 与内嵌静态资源）、流会话管理、预加载缓存、可拖动 H.264 实时转码（`serveH264Transcode`）、静态资源热覆盖（`-ui-dir`）。
+  - `cenc.go` / `hls_mux.go` / `converter.go`：纯 Go ISO/IEC 23001-7 `cenc-aes-ctr` MP4 HTTP Range 实时流解密（含 `moov` 预热与首段明文缓存）、HLS 同源重写与伪装 `.ts` 头剥离、离线下载转封装标准 MP4，以及 `findFFmpegBinary()`（优先查找同级 `bin/ffmpeg.exe`，再回退系统 `PATH`）。
   - `heic_cover.go`：HEIC 封面纯 Go HEVC 帧提取、单帧 MP4 封装与可选宿主机 FFmpeg 转码缓存。
-  - `store.go`：多用户权限、密码校验、追剧/历史记录按用户分文件存储（`users/<id>/*.json`），备份格式（`schema: 1`）与移动端客户端严格互通，修改字段须保持向后兼容。
+  - `store.go`：多用户权限、密码校验、追剧/历史记录按用户分文件存储（`users/<id>/*.json`）；`allKnownSources` 默认全部 11 个站源 `Restricted: false`；备份格式（`schema: 1`）与移动端客户端严格互通，修改字段须保持向后兼容。
 - **`web/ui/`（内嵌响应式 PWA 前端，通过 `embed` 打包）**
-  - `api.js`（接口封装与令牌管理）、`player.js`（双 `<video>` 预缓冲、`hls.js`、弹幕与移动端触控手势）、`app.js`（手机/平板/电脑/电视自适应视图状态机）、`styles.css`。直接修改即可生效，开发时可用 `-ui-dir web/ui` 免重编调试。
+  - `api.js`（接口封装与令牌管理）、`player.js`（双 `<video>` 预缓冲、`hls.js`、编码探测与 `videoWidth === 0` 自动切换 H.264 转码流、弹幕与移动端触控手势）、`app.js`（手机/平板/电脑/电视自适应视图状态机，探索/搜索分页通过 `_updateGridPaginationDOM` 增量追加卡片并保持滚动位置）、`styles.css`。开发时可用 `-ui-dir web/ui` 免重编调试；直接修改后须重编根目录 `zhenguojian-web.exe` 才能在嵌入式发布版中生效。
 
 ## 2. 线程与并发约束
 
@@ -35,19 +35,25 @@
 
 ## 3. 构建与校验方式
 
-- **默认配置**：`core/app_build.go` 默认 `buildAllSources = "true"`（全站源真果鉴）。自动化测试与无头验证一律开启 `DISABLE_REMOTE_IMAGES=true`（或 `-disable-images`），不要下载或读取真实站源图片。
+- **默认配置与运行时**：`core/app_build.go` 默认 `buildAllSources = "true"`，`web/store.go` 将所有 11 个内置站源设为 `Restricted: false`；Windows 开箱版本依赖根目录预编译的 `zhenguojian-web.exe`、一键脚本（`一键启动.bat` / `重新编译并启动.bat`）及 `bin/` 下的 FFmpeg 组件。自动化测试与无头验证一律开启 `DISABLE_REMOTE_IMAGES=true`（或 `-disable-images`），不要下载或读取真实站源图片。
 - **静态检查与单元测试**：
   ```bash
   gofmt -s -w ./core ./web
   go vet ./...
+  # Windows / CGO_ENABLED=0 环境：
+  DISABLE_REMOTE_IMAGES=true go test ./...
+  # 支持 CGO 的环境可加 -race：
   DISABLE_REMOTE_IMAGES=true go test -race ./...
   ```
-- **本地运行与跨平台构建**：
+- **本地运行、重编译与跨平台构建**：
   ```bash
-  # 开发运行（前端热调试可加 -ui-dir web/ui -disable-images）
+  # 开发运行（前端热调试可加 -ui-dir web/ui -disable-images -open=false）
   go run ./web
 
-  # 构建当前主机单文件二进制（输出至 dist/）
+  # 修改 Go 或 web/ui/ 后重建根目录 Windows 可执行文件（或双击 重新编译并启动.bat）
+  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X duanjuapp/native/core.buildAllSources=true -X main.appVersion=1.0.13+113" -o ./zhenguojian-web.exe ./web
+
+  # 构建当前主机单文件二进制（输出至 dist/，不含 bin/）
   python scripts/build.py
 
   # 交叉编译全部平台二进制（Windows / Linux amd64+arm64 / macOS arm64+amd64）
