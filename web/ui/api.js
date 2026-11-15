@@ -351,6 +351,12 @@
         body: "{}"
       });
     },
+    checkSources(sourceId = "") {
+      return requestJSON("/api/sources/check", {
+        method: "POST",
+        body: JSON.stringify(sourceId ? { source: sourceId } : {})
+      });
+    },
 
     importBackup(rawText) {
       return requestJSON("/api/store/backup", {

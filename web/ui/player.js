@@ -10,6 +10,7 @@
   const DANMAKU_WINDOW_MS = 30000;
 
   const HLS_CDNS = [
+    "/vendor/hls.min.js",
     "https://registry.npmmirror.com/hls.js/1.5.15/files/dist/hls.min.js",
     "https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js",
     "https://cdn.staticfile.net/hls.js/1.5.15/hls.min.js",
@@ -126,6 +127,8 @@
       this.routeHadFailureSwitch = false;
       this.manualOriginIndex = -1;
       this.manualOriginWasReady = false;
+      this.preferredRouteIndex = 0;
+      this.initialStartIndex = 0;
       this.onStateUpdate = null;
       this.onEpisodeChange = null;
       this.resolveEpoch = 0;
@@ -397,6 +400,8 @@
       this.preferredQuality = p.quality;
       this.speed = p.speed;
       this.danmakuEnabled = p.danmaku;
+      this.preferredRouteIndex = 0;
+      this.initialStartIndex = 0;
       this.onStateUpdate = onStateUpdate || null;
       this.onEpisodeChange = onEpisodeChange || null;
       this.locked = false;
@@ -566,7 +571,9 @@
       let mediaErrorRecoveries = 0;
       hls.on(HlsLib.Events.MANIFEST_PARSED, () => {
         if (hls === this.standbyHls) {
-          this.standbyReady = true;
+          if (this._hasValidVideoPicture(this.standbyVideo)) {
+            this.standbyReady = true;
+          }
           return;
         }
         if (hls === this.hls && this.active) {
@@ -767,7 +774,8 @@
         this.standbyPlan &&
         !this.standbyFailed &&
         this.standbyVideo &&
-        (this.standbyReady || this.standbyVideo.readyState >= 1)
+        this.standbyReady &&
+        this._hasValidVideoPicture(this.standbyVideo)
       ) {
         const nextPlan = this.preloadedPlan;
         this.preloadedPlan = null;
@@ -786,7 +794,7 @@
       );
 
       if (hasWarmPlan) {
-        this.routeValidating = false;
+        this.routeValidating = !preferLocalOnly;
         this.loadingText = "";
         this.loading = false;
         this._syncUI();
@@ -826,26 +834,22 @@
           return;
         }
 
-        if (routeOpts && Number.isInteger(routeOpts.targetRouteIndex) && routeOpts.targetRouteIndex > 0 && plan && plan.session) {
-          const targetIdx = Math.min(routeOpts.targetRouteIndex, Math.max(0, (plan.routeCount || 1) - 1));
-          while ((plan.routeIndex || 0) < targetIdx && plan.session) {
-            const nextPlan = await API.rpc("fallback", { session: plan.session });
-            if (epoch !== this.resolveEpoch || !this.active) {
-              this._releasePlanSession(nextPlan);
-              return;
-            }
-            plan = nextPlan;
-          }
+        const explicitTarget = routeOpts && Number.isInteger(routeOpts.targetRouteIndex) ? routeOpts.targetRouteIndex : -1;
+        const desiredIdx = explicitTarget >= 0 ? explicitTarget : (!routeOpts && !preferLocalOnly && !providedPlan ? this.preferredRouteIndex : 0);
+        if (desiredIdx > 0 && plan && !plan.local && plan.session && (plan.routeIndex || 0) < desiredIdx) {
+          plan = await this._advancePlanToRouteIndex(plan, desiredIdx, epoch);
+          if (!plan) return;
         }
 
         this.plan = plan;
+        this.initialStartIndex = plan && !plan.local ? (plan.routeIndex || 0) : 0;
         if (plan && plan.local) {
           this.routeValidating = false;
           this.loadingText = "";
         } else if (this.routeValidating && plan) {
           const total = plan.routeCount || 1;
           const idx = plan.routeIndex || 0;
-          const prefix = (routeOpts && routeOpts.loadingPrefix) || "正在校验";
+          const prefix = (routeOpts && routeOpts.loadingPrefix) || (explicitTarget < 0 && idx > 0 ? "正在优先校验" : "正在校验");
           this.loading = true;
           this.loadingText = total > 1 ? `${prefix}线路 ${idx + 1}/${total} 是否可用...` : "正在校验播放线路是否可用...";
           this._syncUI();
@@ -1115,8 +1119,26 @@
       }, ms);
     }
 
+    async _advancePlanToRouteIndex(plan, targetIdx, epoch) {
+      if (!plan || !plan.session || targetIdx <= (plan.routeIndex || 0)) return plan;
+      const clamped = Math.min(targetIdx, Math.max(0, (plan.routeCount || 1) - 1));
+      let cur = plan;
+      while ((cur.routeIndex || 0) < clamped && cur.session) {
+        const nextPlan = await API.rpc("fallback", { session: cur.session });
+        if (!this.active || (epoch !== null && epoch !== this.resolveEpoch)) {
+          this._releasePlanSession(nextPlan);
+          return null;
+        }
+        cur = nextPlan;
+      }
+      return cur;
+    }
+
     _markRouteVerified() {
       clearTimeout(this.routeCheckTimer);
+      if (this.plan && !this.plan.local) {
+        this.preferredRouteIndex = this.plan.routeIndex || 0;
+      }
       if (!this.routeValidating) {
         if (this.loading) {
           this.loading = false;
@@ -1293,7 +1315,7 @@
         }
       }
 
-      if (isManual && totalRoutes > 1) {
+      if ((isManual || this.initialStartIndex > 0) && totalRoutes > 1) {
         let wrapTarget = -1;
         for (let i = 0; i < totalRoutes; i++) {
           if (this.routeFailedSet.has(i)) continue;
@@ -1307,7 +1329,7 @@
           const prefix = prevIdx >= 0 ? `线路 ${prevIdx + 1} 不可用，继续校验` : "正在校验";
           await this._loadEpisode(this.currentIndex, this.resumePosition, false, null, {
             preserveFailedSet: true,
-            manualMode: true,
+            manualMode: isManual,
             hadFailureSwitch: prevIdx >= 0,
             targetRouteIndex: wrapTarget,
             loadingPrefix: prefix,
@@ -1471,12 +1493,15 @@
       this._clearPreloadedState(false);
       this.preloadedKey = key;
       try {
-        const p = await API.rpc("preload", {
+        let p = await API.rpc("preload", {
           drama: this.drama,
           chapter: nextEp.raw,
           index: nextEp.number,
           quality: this.preferredQuality
         });
+        if (this.active && this.preloadedKey === key && this.preferredRouteIndex > 0 && p && !p.local && p.session) {
+          p = await this._advancePlanToRouteIndex(p, this.preferredRouteIndex, null);
+        }
         if (this.active && this.preloadedKey === key && this.currentIndex + 1 === nextEp.number && p && p.url) {
           this.preloadedPlan = p;
           this._warmStandbyPlan(key, p);
@@ -1856,7 +1881,7 @@
         });
         v.addEventListener("loadedmetadata", () => {
           if (v === this.standbyVideo) {
-            if (this.standbyPlan && !this.standbyFailed) {
+            if (this.standbyPlan && !this.standbyFailed && this._hasValidVideoPicture(v)) {
               this.standbyReady = true;
             }
             return;
@@ -1865,8 +1890,20 @@
           this._onMediaReady();
         });
         v.addEventListener("loadeddata", () => {
-          if (v === this.standbyVideo && this.standbyPlan && !this.standbyFailed) {
-            this.standbyReady = true;
+          if (v === this.standbyVideo) {
+            if (this.standbyPlan && !this.standbyFailed) {
+              if (this._hasValidVideoPicture(v)) {
+                this.standbyReady = true;
+              } else {
+                const sbEp = this.standbyEpoch;
+                setTimeout(() => {
+                  if (v === this.standbyVideo && sbEp === this.standbyEpoch && !this._hasValidVideoPicture(v)) {
+                    this.standbyFailed = true;
+                    this.standbyReady = false;
+                  }
+                }, 450);
+              }
+            }
             return;
           }
           if (v !== this.video) return;
@@ -1877,6 +1914,12 @@
           }
         });
         v.addEventListener("resize", () => {
+          if (v === this.standbyVideo) {
+            if (this.standbyPlan && !this.standbyFailed && this._hasValidVideoPicture(v)) {
+              this.standbyReady = true;
+            }
+            return;
+          }
           if (v !== this.video) return;
           if (this._hasValidVideoPicture(v)) {
             clearTimeout(this.noPictureTimer);
@@ -1886,7 +1929,7 @@
         });
         v.addEventListener("canplay", () => {
           if (v === this.standbyVideo) {
-            if (this.standbyPlan && !this.standbyFailed) {
+            if (this.standbyPlan && !this.standbyFailed && this._hasValidVideoPicture(v)) {
               this.standbyReady = true;
             }
             return;

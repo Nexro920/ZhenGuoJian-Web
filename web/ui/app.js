@@ -121,6 +121,8 @@
       this.storageInfo = null;
       this.resourceSettings = null;
       this.logLines = [];
+      this.sourceCheckResults = {};
+      this.checkingSources = false;
 
       this.detailOpen = false;
       this.detailDrama = null;
@@ -2490,22 +2492,41 @@
           `;
         }
 
-        case "sources":
+        case "sources": {
+          const checkMap = this.sourceCheckResults || {};
+          const checkedValues = Object.values(checkMap);
+          const okCount = checkedValues.filter((r) => r && r.ok).length;
+          const summaryText = checkedValues.length
+            ? `已检测 ${checkedValues.length} 个站源：${okCount} 个可用，${checkedValues.length - okCount} 个不可用`
+            : "点击右侧按钮可批量测试所有内置站源的连通性与响应耗时";
           return `
             <div class="settings-card">
-              <div class="setting-label" style="margin-bottom:10px;">站源总开关（共 ${(st.knownSources || []).length} 个内置站源）</div>
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;flex-wrap:wrap;">
+                <div>
+                  <div class="setting-label">站源总开关（共 ${(st.knownSources || []).length} 个内置站源）</div>
+                  <div class="setting-desc">${esc(summaryText)}</div>
+                </div>
+                <button class="btn btn-sm" id="checkAllSourcesBtn" ${this.checkingSources ? "disabled" : ""}>${this.checkingSources ? "正在检测..." : "检测全部站源"}</button>
+              </div>
               ${(st.knownSources || [])
-                .map(
-                  (s) => `
+                .map((s) => {
+                  const res = checkMap[s.id];
+                  const statusHtml = res
+                    ? res.ok
+                      ? `<div class="setting-desc" style="color:var(--success,#16a34a);">可用 · ${Number(res.latencyMs || 0)}ms（${Number(res.count || 0)}条）</div>`
+                      : `<div class="setting-desc" style="color:var(--danger,#dc2626);">不可用：${esc(res.error || "连接失败")}</div>`
+                    : "";
+                  return `
                 <div class="setting-row">
                   <div>
                     <div class="setting-label">${esc(s.name)} ${s.restricted ? `<span style="font-size:11px;color:var(--warning);">[扩展源]</span>` : ""}</div>
                     <div class="setting-desc">${esc(s.description || s.id)}</div>
+                    ${statusHtml}
                   </div>
                   <button class="switch ${st.sourceSwitches && st.sourceSwitches[s.id] ? "on" : ""}" data-src-sw="${esc(s.id)}"></button>
                 </div>
-              `
-                )
+              `;
+                })
                 .join("")}
             </div>
             <div class="settings-card">
@@ -2529,6 +2550,7 @@
               </div>
             </div>
           `;
+        }
 
         case "proxy":
           return `
@@ -3217,6 +3239,31 @@
           if (res.state) this.setState(res.state);
         };
       });
+      const checkAllBtn = document.getElementById("checkAllSourcesBtn");
+      if (checkAllBtn) {
+        checkAllBtn.onclick = async () => {
+          if (this.checkingSources) return;
+          this.checkingSources = true;
+          this.render();
+          try {
+            const res = await API.checkSources();
+            const map = {};
+            const list = Array.isArray(res.results) ? res.results : [];
+            for (const item of list) {
+              if (item && item.id) map[item.id] = item;
+            }
+            this.sourceCheckResults = map;
+            const okCount = list.filter((item) => item && item.ok).length;
+            toast(`站源检测完成：${okCount}/${list.length} 个可用`);
+          } catch (err) {
+            toast(`站源检测失败：${err.message || err}`);
+          } finally {
+            this.checkingSources = false;
+            this.render();
+          }
+        };
+      }
+
       container.querySelectorAll("[data-src-sw]").forEach((sw) => {
         sw.onclick = async () => {
           const id = sw.getAttribute("data-src-sw");

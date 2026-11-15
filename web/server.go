@@ -39,41 +39,62 @@ type cachedPlaybackPlan struct {
 }
 
 type webAppServer struct {
-	version       string
-	disableImages bool
-	uiOverrideDir string
-	tempDir       string
-	store         *webStore
-	diary         *webDiary
-	cenc          *cencStreamManager
-	heicCompat    *heicCompatManager
-	converter     *conversionWorker
-	streamClient  *http.Client
-	planMu        sync.Mutex
-	plans         map[string]cachedPlaybackPlan
-	encryptedHLS  map[string]time.Time
-	coverMu       sync.Mutex
-	knownCovers   map[string]string
-	rpcSeq        atomic.Int64
+	version         string
+	disableImages   bool
+	uiOverrideDir   string
+	tempDir         string
+	store           *webStore
+	diary           *webDiary
+	cenc            *cencStreamManager
+	heicCompat      *heicCompatManager
+	converter       *conversionWorker
+	streamClient    *http.Client
+	planMu          sync.Mutex
+	plans           map[string]cachedPlaybackPlan
+	encryptedHLS    map[string]time.Time
+	coverMu         sync.Mutex
+	knownCovers     map[string]string
+	transcodeMu     sync.Mutex
+	transcodeActive map[string]transcodeSessionEntry
+	transcodeSlots  chan struct{}
+	sourceProbeFunc func(ctx context.Context, sourceID string) sourceCheckResult
+	rpcSeq          atomic.Int64
+}
+
+type transcodeSessionEntry struct {
+	id     int64
+	cancel context.CancelFunc
+}
+
+type sourceCheckResult struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	OK        bool   `json:"ok"`
+	LatencyMs int64  `json:"latencyMs"`
+	Count     int    `json:"count"`
+	Error     string `json:"error,omitempty"`
 }
 
 func newWebAppServer(version string, disableImages bool, uiOverrideDir, tempDir string, store *webStore, diary *webDiary) *webAppServer {
 	cenc := newCENCStreamManager()
 	srv := &webAppServer{
-		version:       version,
-		disableImages: disableImages,
-		uiOverrideDir: uiOverrideDir,
-		tempDir:       tempDir,
-		store:         store,
-		diary:         diary,
-		cenc:          cenc,
-		heicCompat:    newHEICCompatManager(filepath.Dir(tempDir)),
-		converter:     newConversionWorker(diary),
-		streamClient:  &http.Client{Timeout: 0, Transport: &http.Transport{Proxy: nil}},
-		plans:         map[string]cachedPlaybackPlan{},
-		encryptedHLS:  map[string]time.Time{},
-		knownCovers:   map[string]string{},
+		version:         version,
+		disableImages:   disableImages,
+		uiOverrideDir:   uiOverrideDir,
+		tempDir:         tempDir,
+		store:           store,
+		diary:           diary,
+		cenc:            cenc,
+		heicCompat:      newHEICCompatManager(filepath.Dir(tempDir)),
+		converter:       newConversionWorker(diary),
+		streamClient:    &http.Client{Timeout: 0, Transport: &http.Transport{Proxy: nil}},
+		plans:           map[string]cachedPlaybackPlan{},
+		encryptedHLS:    map[string]time.Time{},
+		knownCovers:     map[string]string{},
+		transcodeActive: map[string]transcodeSessionEntry{},
+		transcodeSlots:  make(chan struct{}, 2),
 	}
+	srv.sourceProbeFunc = srv.defaultSourceProbe
 	srv.rpcSeq.Store(time.Now().UnixMicro())
 	return srv
 }
@@ -81,6 +102,7 @@ func newWebAppServer(version string, disableImages bool, uiOverrideDir, tempDir 
 func (srv *webAppServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/bootstrap", srv.handleBootstrap)
+	mux.HandleFunc("/api/sources/check", srv.handleSourcesCheck)
 	mux.HandleFunc("/api/rpc", srv.handleRPC)
 	mux.HandleFunc("/api/cover", srv.handleCover)
 	mux.HandleFunc("/api/cover-compatible", srv.handleCoverCompatible)
@@ -767,7 +789,7 @@ func (srv *webAppServer) handleStream(writer http.ResponseWriter, request *http.
 	upstreamURL := origin + "/" + streamToken + "/" + assetName
 
 	if request.URL.Query().Get("transcode") == "h264" {
-		srv.serveH264Transcode(writer, request, upstreamURL, srv.cenc.keyForToken(streamToken), request.URL.Query().Get("start"), strings.HasSuffix(strings.ToLower(assetName), ".m3u8"))
+		srv.serveH264Transcode(writer, request, streamToken, upstreamURL, srv.cenc.keyForToken(streamToken), request.URL.Query().Get("start"), strings.HasSuffix(strings.ToLower(assetName), ".m3u8"))
 		return
 	}
 
@@ -847,18 +869,7 @@ func (srv *webAppServer) handleStream(writer http.ResponseWriter, request *http.
 	}
 }
 
-func (srv *webAppServer) serveH264Transcode(writer http.ResponseWriter, request *http.Request, inputSource string, decryptionKey []byte, startRaw string, isHLS bool) {
-	ffmpeg := findFFmpegBinary()
-	if ffmpeg == "" {
-		http.Error(writer, "当前环境未安装 FFmpeg，无法进行实时兼容转码", http.StatusNotImplemented)
-		return
-	}
-	writer.Header().Set("Content-Type", "video/mp4")
-	writer.Header().Set("Cache-Control", "no-store")
-	if request.Method == http.MethodHead {
-		writer.WriteHeader(http.StatusOK)
-		return
-	}
+func buildH264TranscodeArgs(inputSource string, decryptionKey []byte, startRaw string, isHLS bool) []string {
 	args := []string{"-v", "error"}
 	if len(decryptionKey) == 16 {
 		args = append(args, "-decryption_key", hex.EncodeToString(decryptionKey))
@@ -887,11 +898,68 @@ func (srv *webAppServer) serveH264Transcode(writer http.ResponseWriter, request 
 		"-f", "mp4",
 		"pipe:1",
 	)
+	return args
+}
+
+func (srv *webAppServer) beginTranscodeSession(streamToken string, parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	if streamToken == "" {
+		return ctx, cancel
+	}
+	entryID := srv.rpcSeq.Add(1)
+	srv.transcodeMu.Lock()
+	if prev, ok := srv.transcodeActive[streamToken]; ok && prev.cancel != nil {
+		prev.cancel()
+	}
+	if srv.transcodeActive == nil {
+		srv.transcodeActive = map[string]transcodeSessionEntry{}
+	}
+	srv.transcodeActive[streamToken] = transcodeSessionEntry{id: entryID, cancel: cancel}
+	srv.transcodeMu.Unlock()
+
+	return ctx, func() {
+		cancel()
+		srv.transcodeMu.Lock()
+		if cur, ok := srv.transcodeActive[streamToken]; ok && cur.id == entryID {
+			delete(srv.transcodeActive, streamToken)
+		}
+		srv.transcodeMu.Unlock()
+	}
+}
+
+func (srv *webAppServer) serveH264Transcode(writer http.ResponseWriter, request *http.Request, streamToken, inputSource string, decryptionKey []byte, startRaw string, isHLS bool) {
+	ffmpeg := findFFmpegBinary()
+	if ffmpeg == "" {
+		http.Error(writer, "当前环境未安装 FFmpeg，无法进行实时兼容转码", http.StatusNotImplemented)
+		return
+	}
+	if request.Method == http.MethodHead {
+		writer.Header().Set("Content-Type", "video/mp4")
+		writer.Header().Set("Cache-Control", "no-store")
+		writer.WriteHeader(http.StatusOK)
+		return
+	}
+
+	txCtx, releaseTx := srv.beginTranscodeSession(streamToken, request.Context())
+	defer releaseTx()
+
+	if srv.transcodeSlots != nil {
+		select {
+		case srv.transcodeSlots <- struct{}{}:
+			defer func() { <-srv.transcodeSlots }()
+		case <-txCtx.Done():
+			return
+		}
+	}
+
+	writer.Header().Set("Content-Type", "video/mp4")
+	writer.Header().Set("Cache-Control", "no-store")
+	args := buildH264TranscodeArgs(inputSource, decryptionKey, startRaw, isHLS)
 	var errBuf bytes.Buffer
-	cmd := exec.CommandContext(request.Context(), ffmpeg, args...)
+	cmd := exec.CommandContext(txCtx, ffmpeg, args...)
 	cmd.Stdout = writer
 	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil && request.Context().Err() == nil {
+	if err := cmd.Run(); err != nil && txCtx.Err() == nil {
 		msg := strings.TrimSpace(errBuf.String())
 		if msg == "" {
 			msg = err.Error()
@@ -900,6 +968,139 @@ func (srv *webAppServer) serveH264Transcode(writer http.ResponseWriter, request 
 			srv.diary.add("[转码] FFmpeg H.264 转码失败：" + msg)
 		}
 	}
+}
+
+func (srv *webAppServer) defaultSourceProbe(ctx context.Context, sourceID string) sourceCheckResult {
+	start := time.Now()
+	session := fmt.Sprintf("probe:%s:%d", sourceID, srv.rpcSeq.Add(1))
+	payload := map[string]any{
+		"page":    1,
+		"force":   true,
+		"session": session,
+	}
+	if sourceID == "hongguo" {
+		payload["action"] = "recommendations"
+	} else {
+		payload["action"] = "catalog"
+		payload["source"] = sourceID
+	}
+	rawReq, _ := json.Marshal(payload)
+
+	type probeOut struct {
+		raw string
+	}
+	ch := make(chan probeOut, 1)
+	go func() {
+		ch <- probeOut{raw: core.NativeRequest(string(rawReq))}
+	}()
+
+	var rawResp string
+	select {
+	case out := <-ch:
+		rawResp = out.raw
+	case <-ctx.Done():
+		cancelBytes, _ := json.Marshal(map[string]any{"action": "cancelRead", "session": session})
+		_ = core.NativeRequest(string(cancelBytes))
+		return sourceCheckResult{
+			ID:        sourceID,
+			OK:        false,
+			LatencyMs: time.Since(start).Milliseconds(),
+			Error:     "检测超时",
+		}
+	}
+
+	var env struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+		Data  struct {
+			Items []any `json:"items"`
+		} `json:"data"`
+	}
+	res := sourceCheckResult{
+		ID:        sourceID,
+		LatencyMs: time.Since(start).Milliseconds(),
+	}
+	if err := json.Unmarshal([]byte(rawResp), &env); err != nil {
+		res.Error = "返回解析失败"
+		return res
+	}
+	if !env.OK {
+		res.Error = strings.TrimSpace(env.Error)
+		if res.Error == "" {
+			res.Error = "请求失败"
+		}
+		return res
+	}
+	res.OK = true
+	res.Count = len(env.Data.Items)
+	return res
+}
+
+func (srv *webAppServer) handleSourcesCheck(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	token := srv.browserToken(writer, request)
+	if err := srv.store.authorizeAction(token, "", false, false); err != nil {
+		writeAPIError(writer, http.StatusForbidden, err)
+		return
+	}
+	var body struct {
+		Source string `json:"source"`
+	}
+	_ = readJSONBody(request, &body)
+
+	known := availableSourceSites()
+	var targets []sourceSiteInfo
+	if reqID := strings.TrimSpace(body.Source); reqID != "" {
+		for _, s := range known {
+			if s.ID == reqID {
+				targets = append(targets, s)
+				break
+			}
+		}
+		if len(targets) == 0 {
+			writeAPIError(writer, http.StatusBadRequest, errors.New("未知站源"))
+			return
+		}
+	} else {
+		targets = known
+	}
+
+	probeFn := srv.sourceProbeFunc
+	if probeFn == nil {
+		probeFn = srv.defaultSourceProbe
+	}
+
+	results := make([]sourceCheckResult, len(targets))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for idx, src := range targets {
+		wg.Add(1)
+		go func(i int, s sourceSiteInfo) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-request.Context().Done():
+				results[i] = sourceCheckResult{ID: s.ID, Name: s.Name, OK: false, Error: "已取消"}
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(request.Context(), 12*time.Second)
+			defer cancel()
+			res := probeFn(probeCtx, s.ID)
+			res.ID = s.ID
+			res.Name = s.Name
+			results[i] = res
+		}(idx, src)
+	}
+	wg.Wait()
+
+	writeJSONResponse(writer, http.StatusOK, map[string]any{
+		"ok":      true,
+		"results": results,
+	})
 }
 
 func (srv *webAppServer) handleLocalMedia(writer http.ResponseWriter, request *http.Request) {
@@ -928,7 +1129,8 @@ func (srv *webAppServer) handleLocalMedia(writer http.ResponseWriter, request *h
 		return
 	}
 	if request.URL.Query().Get("transcode") == "h264" {
-		srv.serveH264Transcode(writer, request, filePath, nil, request.URL.Query().Get("start"), false)
+		localKey := fmt.Sprintf("local:%s:%d", dramaID, index)
+		srv.serveH264Transcode(writer, request, localKey, filePath, nil, request.URL.Query().Get("start"), false)
 		return
 	}
 	f, err := os.Open(filePath)
