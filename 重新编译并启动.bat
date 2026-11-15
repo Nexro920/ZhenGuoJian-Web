@@ -25,7 +25,7 @@ if exist "%~dp0VERSION" set /p APP_VER=<"%~dp0VERSION"
 echo 正在编译真果鉴网页版 (%APP_VER%)...
 set "CGO_ENABLED=0"
 if "%GOPROXY%"=="" set "GOPROXY=https://goproxy.cn,direct"
-"%GO_BIN%" build -trimpath -ldflags="-s -w -X duanjuapp/native/core.buildAllSources=true -X main.appVersion=%APP_VER%" -o "%EXE_PATH%" ./web
+"%GO_BIN%" build -trimpath -ldflags="-s -w -X main.appVersion=%APP_VER%" -o "%EXE_PATH%" ./web
 if errorlevel 1 (
     echo [错误] 编译失败。
     pause

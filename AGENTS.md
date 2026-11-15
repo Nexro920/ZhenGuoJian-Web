@@ -51,7 +51,7 @@
   go run ./web
 
   # 修改 Go 或 web/ui/ 后重建根目录 Windows 可执行文件（或双击 重新编译并启动.bat）
-  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X duanjuapp/native/core.buildAllSources=true -X main.appVersion=1.0.13+113" -o ./zhenguojian-web.exe ./web
+  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=1.0.13+113" -o ./zhenguojian-web.exe ./web
 
   # 构建当前主机单文件二进制（输出至 dist/，不含 bin/）
   python scripts/build.py

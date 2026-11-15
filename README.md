@@ -150,7 +150,6 @@ ZhenGuoJian-Web/
 ├── bin/                   # Windows 预置 FFmpeg / FFprobe 运行时及依赖 DLL
 ├── scripts/
 │   └── build.py           # 跨平台静态单文件构建脚本
-├── .github/workflows/     # GitHub Actions 自动化编译与发布工作流（仅构建 Go 单文件，不含 bin/）
 ├── zhenguojian-web.exe    # Windows 预编译可执行文件
 ├── 一键启动.bat           # Windows 一键启动脚本（无 exe 时自动编译）
 ├── 重新编译并启动.bat     # Windows 一键静态重编译并启动脚本

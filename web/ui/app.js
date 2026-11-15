@@ -2613,9 +2613,16 @@
               <div class="setting-row">
                 <div>
                   <div class="setting-label">开源仓库</div>
-                  <div class="setting-desc">github.com/wzdyf1992/ZhenGuoJian-Web</div>
+                  <div class="setting-desc">github.com/Nexro920/ZhenGuoJian-Web</div>
                 </div>
-                <a class="btn btn-sm" href="https://github.com/wzdyf1992/ZhenGuoJian-Web" target="_blank" rel="noopener noreferrer">访问 GitHub</a>
+                <a class="btn btn-sm" href="https://github.com/Nexro920/ZhenGuoJian-Web" target="_blank" rel="noopener noreferrer">访问 GitHub</a>
+              </div>
+              <div class="setting-row">
+                <div>
+                  <div class="setting-label">原仓库致谢</div>
+                  <div class="setting-desc">基于 github.com/wzdyf1992/ZhenGuoJian-Web 复制并维护</div>
+                </div>
+                <a class="btn btn-sm" href="https://github.com/wzdyf1992/ZhenGuoJian-Web" target="_blank" rel="noopener noreferrer">原仓库</a>
               </div>
               <div class="setting-row">
                 <div>
