@@ -6,7 +6,26 @@
 
 **真果鉴网页版**是一款**单文件、零外部运行时依赖（`CGO_ENABLED=0`）**的跨平台短剧与影视自托管 Web 应用。内嵌多站源请求签名引擎、实时音视频流解密重封装服务与响应式 PWA 前端，只需运行单个可执行文件，即可在手机、平板、电脑或智能电视浏览器中直接使用。
 
-> 移动端原生客户端（Android / Android TV / iOS）见姐妹仓库：[**ZhenGuoJian-Mobile**](https://github.com/wzdyf1992/ZhenGuoJian-Mobile)。两个项目的备份文件（`schema: 1`）完全互通。
+> **仓库说明**：本仓库基于原项目 [**wzdyf1992/ZhenGuoJian-Web**](https://github.com/wzdyf1992/ZhenGuoJian-Web) 复制并维护，在保留原有特性与 GPL-3.0 开源协议的基础上，针对开箱即用、多站源解析兼容性、视频硬解/转码与前端分页体验修复了若干问题。
+>
+> 移动端原生客户端（Android / Android TV / iOS）见原仓库姐妹项目：[**ZhenGuoJian-Mobile**](https://github.com/wzdyf1992/ZhenGuoJian-Mobile)。两个项目的备份文件（`schema: 1`）完全互通。
+
+---
+
+## 本仓库修复与增强说明
+
+相比原仓库，本仓库主要做了以下修复与适配：
+
+- **Windows 一键启动与开箱即用**：
+  - 仓库直接提供预编译的 `zhenguojian-web.exe`、一键启动脚本 `一键启动.bat` 以及源码重编译脚本 `重新编译并启动.bat`，Windows 用户下载完整仓库后无需配置 Go 环境即可直接运行。
+  - 仓库内置 `bin/` 目录（包含 `ffmpeg.exe`、`ffprobe.exe` 及配套 DLL），开箱即可支持浏览器不支持编码的视频实时转码播放，无需再单独安装配置 FFmpeg。
+- **全站源默认开启与站源解析修复**：
+  - 编译构建默认注入 `-X duanjuapp/native/core.buildAllSources=true`，完整放开内置全部 11 个站源。
+  - 修复部分站源（如黄果、黄剧、青空/Sorani、野果、韩小圈、黄豆及离线 AI 分类等）在列表分类、分页检索或视频地址解析时直接失败、返回 HTTP 410 / 域名请求失败的问题。
+- **解决“只有声音没有画面”（HEVC / ByteVC1）播放问题**：
+  - 针对部分站源（如红果等）下发浏览器不支持原生解码的 HEVC / `bytevc1` 视频流导致“有声无画”的情况，服务端补充视频编码与时长探测，结合内置 `bin/ffmpeg.exe` 提供可拖动（Seekable）的 H.264 实时转码输出；前端播放器检测 `videoWidth === 0` 时自动回退至兼容转码流。
+- **优化列表下滑加载滚动体验**：
+  - 修复探索页与搜索页下滑触发加载更多时页面跳回顶部的问题，改为在现有列表尾部增量追加新卡片并保留当前滚动条位置。
 
 ---
 
@@ -47,24 +66,38 @@
 
 ---
 
-## 快速开始
+## 快速开始（使用方式）
 
-### 1. 下载运行
+### 1. Windows 一键启动（推荐，开箱即用）
 
-前往 [**Releases**](https://github.com/wzdyf1992/ZhenGuoJian-Web/releases) 下载对应系统的可执行文件并直接运行：
+本仓库已附带编译好的 `zhenguojian-web.exe` 与 `bin/` 下的 FFmpeg 组件，Windows 用户只需两步即可使用：
+
+1. **获取完整项目**：
+   - 使用 Git 克隆：`git clone https://github.com/Nexro920/ZhenGuoJian-Web.git`
+   - 或在 GitHub 页面点击 **Code → Download ZIP** 下载压缩包并解压到本地目录。
+2. **双击启动**：
+   - 直接双击根目录下的 **`一键启动.bat`** 即可运行。
+   - 若目录中不存在 `zhenguojian-web.exe` 且本机已安装 Go 1.24+，脚本会自动执行静态编译并启动。
+   - 修改源码后如需重新打包运行，可双击 **`重新编译并启动.bat`**（需本机安装 Go 1.24+）。
+
+启动后终端会打印本机访问地址（默认 `http://127.0.0.1:7080`）及局域网 IPv4 地址（自动过滤虚拟网卡与代理隧道），在同一局域网的电脑、手机或电视浏览器打开即可；运行过程中生成的封面缓存、用户记录与下载内容会自动保存在同级 `data/` 目录中。
+
+> 如在命令行运行，也可使用参数自动打开浏览器：
+> ```powershell
+> .\zhenguojian-web.exe -open
+> ```
+
+### 2. Linux / macOS 编译运行
+
+Linux / macOS 用户可通过 Go 工具链直接编译启动（如需启用全站源请传入 `buildAllSources=true`）：
 
 ```bash
-# Linux / macOS
-chmod +x ./zhenguojian-web-linux-amd64
-./zhenguojian-web-linux-amd64
-
-# Windows PowerShell
-.\zhenguojian-web-windows-amd64.exe -open
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X duanjuapp/native/core.buildAllSources=true -X main.appVersion=1.0.13+113" -o ./zhenguojian-web ./web
+chmod +x ./zhenguojian-web
+./zhenguojian-web
 ```
 
-启动后终端会打印本机访问地址（默认 `http://127.0.0.1:7080`）及局域网 IPv4 地址（自动过滤虚拟网卡与代理隧道），在同一局域网的电脑、手机或电视浏览器打开即可。
-
-### 2. 命令行参数与环境变量
+### 3. 命令行参数与环境变量
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -111,11 +144,15 @@ go test -race ./...
 ```text
 ZhenGuoJian-Web/
 ├── core/                  # Go 多站源核心引擎（站源解析、签名、目录缓存、流代理、弹幕、下载调度）
-├── web/                   # 独立 Web 服务端（HTTP API、纯 Go CENC 实时解密、HLS 封装、HEIC 处理、多用户存储）
+├── web/                   # 独立 Web 服务端（HTTP API、纯 Go CENC 实时解密、HLS 封装、HEIC/FFmpeg 转码、多用户存储）
 │   └── ui/                # 内嵌响应式前端（HTML / CSS / 原生 JS 模块 / PWA Manifest & Service Worker）
+├── bin/                   # Windows 预置 FFmpeg / FFprobe 运行时及依赖 DLL
 ├── scripts/
 │   └── build.py           # 跨平台静态单文件构建脚本
 ├── .github/workflows/     # GitHub Actions 自动化编译与发布工作流
+├── zhenguojian-web.exe    # Windows 预编译可执行文件（全站源开启）
+├── 一键启动.bat           # Windows 一键启动脚本（无 exe 时自动编译）
+├── 重新编译并启动.bat     # Windows 一键静态重编译并启动脚本
 ├── go.mod
 ├── VERSION
 └── LICENSE
@@ -134,4 +171,5 @@ ZhenGuoJian-Web/
 
 ## 开源协议与致谢
 
-本项目核心站源框架改编自 [fish2018](https://github.com/fish2018) 的开源代码，整体以 [**GNU General Public License v3.0 (GPL-3.0)**](LICENSE) 协议发布。第三方依赖遵循各自的开源许可证。
+- 本仓库复制并修改自 [**wzdyf1992/ZhenGuoJian-Web**](https://github.com/wzdyf1992/ZhenGuoJian-Web)，感谢原作者的开源贡献。
+- 原项目核心站源框架改编自 [fish2018](https://github.com/fish2018) 的开源代码，整体以 [**GNU General Public License v3.0 (GPL-3.0)**](LICENSE) 协议发布。第三方依赖（包括预置的 FFmpeg 组件）遵循各自的开源许可证。
