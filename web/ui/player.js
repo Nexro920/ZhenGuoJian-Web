@@ -118,12 +118,21 @@
       this.preloadedKey = "";
       this.preloadedPlan = null;
       this.fallbackCount = 0;
+      this.loadingText = "";
+      this.routeCheckTimer = null;
+      this.routeValidating = false;
+      this.routeCheckMode = "initial";
+      this.routeFailedSet = new Set();
+      this.routeHadFailureSwitch = false;
+      this.manualOriginIndex = -1;
+      this.manualOriginWasReady = false;
       this.onStateUpdate = null;
       this.onEpisodeChange = null;
       this.resolveEpoch = 0;
       this.attachEpoch = 0;
       this.ignoringMediaError = false;
       this.handlingFailureEpoch = -1;
+      this.routeFailureHandledAttach = -1;
       this.triedTranscode = false;
       this.probedHlsForUrl = "";
       this.baseStreamUrl = "";
@@ -419,8 +428,11 @@
       if (!this.active) return;
       this.resolveEpoch++;
       this.active = false;
+      this.routeValidating = false;
+      this.loadingText = "";
       clearTimeout(this.loadingDelayTimer);
       clearTimeout(this.preloadDelayTimer);
+      clearTimeout(this.routeCheckTimer);
       clearTimeout(this.noPictureTimer);
       clearTimeout(this.hideControlsTimer);
       clearTimeout(this._hudTimer);
@@ -503,6 +515,7 @@
     _destroyMedia(fullReset) {
       this.attachEpoch++;
       this.ignoringMediaError = true;
+      clearTimeout(this.routeCheckTimer);
       clearTimeout(this.noPictureTimer);
       if (this.hls) {
         try {
@@ -687,10 +700,11 @@
       this._queueNextPreload(450);
     }
 
-    async _loadEpisode(epNum, seekTo, preferLocalOnly, providedPlan) {
+    async _loadEpisode(epNum, seekTo, preferLocalOnly, providedPlan, routeOpts) {
       const epoch = ++this.resolveEpoch;
       clearTimeout(this.loadingDelayTimer);
       clearTimeout(this.preloadDelayTimer);
+      clearTimeout(this.routeCheckTimer);
 
       const prevWatch = this._captureWatchSnapshot();
       if (prevWatch) {
@@ -710,6 +724,16 @@
       this.probedHlsForUrl = "";
       this.baseStreamUrl = "";
       this.transcodeOffset = 0;
+      const keepFailed = !!(routeOpts && routeOpts.preserveFailedSet);
+      if (!keepFailed) {
+        this.routeFailedSet = new Set();
+        this.manualOriginIndex = -1;
+        this.manualOriginWasReady = false;
+      }
+      this.routeCheckMode = routeOpts && routeOpts.manualMode ? "manual" : "initial";
+      this.routeHadFailureSwitch = !!(routeOpts && routeOpts.hadFailureSwitch);
+      this.routeValidating = !preferLocalOnly;
+      this.loadingText = (routeOpts && routeOpts.loadingText) || `正在解析第 ${epNum} 集播放流并校验线路...`;
       clearTimeout(this.noPictureTimer);
       this.danmakuBuckets.clear();
       this.danmakuFired.clear();
@@ -732,6 +756,7 @@
       );
 
       if (
+        !routeOpts &&
         !providedPlan &&
         !preferLocalOnly &&
         this.resumePosition <= 0 &&
@@ -747,18 +772,22 @@
         const nextPlan = this.preloadedPlan;
         this.preloadedPlan = null;
         this.preloadedKey = "";
+        this.routeValidating = false;
+        this.loadingText = "";
         this._promoteStandbyToActive(nextPlan, epoch);
         return;
       }
 
       this._destroyMedia(false);
 
-      const hasWarmPlan = !!(
+      const hasWarmPlan = !routeOpts && !!(
         (providedPlan && providedPlan.url && !preferLocalOnly) ||
         (this.preloadedKey === preloadKey && this.preloadedPlan && !preferLocalOnly)
       );
 
       if (hasWarmPlan) {
+        this.routeValidating = false;
+        this.loadingText = "";
         this.loading = false;
         this._syncUI();
         this._armLoadingSpinner(epoch, 220);
@@ -769,9 +798,9 @@
 
       try {
         let plan = null;
-        if (providedPlan && providedPlan.url && !preferLocalOnly) {
+        if (providedPlan && providedPlan.url && !preferLocalOnly && !routeOpts) {
           plan = providedPlan;
-        } else if (this.preloadedKey === preloadKey && this.preloadedPlan && !preferLocalOnly) {
+        } else if (!routeOpts && this.preloadedKey === preloadKey && this.preloadedPlan && !preferLocalOnly) {
           plan = this.preloadedPlan;
           this.preloadedPlan = null;
           this.preloadedKey = "";
@@ -797,11 +826,47 @@
           return;
         }
 
+        if (routeOpts && Number.isInteger(routeOpts.targetRouteIndex) && routeOpts.targetRouteIndex > 0 && plan && plan.session) {
+          const targetIdx = Math.min(routeOpts.targetRouteIndex, Math.max(0, (plan.routeCount || 1) - 1));
+          while ((plan.routeIndex || 0) < targetIdx && plan.session) {
+            const nextPlan = await API.rpc("fallback", { session: plan.session });
+            if (epoch !== this.resolveEpoch || !this.active) {
+              this._releasePlanSession(nextPlan);
+              return;
+            }
+            plan = nextPlan;
+          }
+        }
+
         this.plan = plan;
-        await this._attachStream(plan, epoch);
+        if (plan && plan.local) {
+          this.routeValidating = false;
+          this.loadingText = "";
+        } else if (this.routeValidating && plan) {
+          const total = plan.routeCount || 1;
+          const idx = plan.routeIndex || 0;
+          const prefix = (routeOpts && routeOpts.loadingPrefix) || "正在校验";
+          this.loading = true;
+          this.loadingText = total > 1 ? `${prefix}线路 ${idx + 1}/${total} 是否可用...` : "正在校验播放线路是否可用...";
+          this._syncUI();
+        }
+
+        try {
+          await this._attachStream(plan, epoch);
+        } catch (attachErr) {
+          if (epoch !== this.resolveEpoch || !this.active) return;
+          if (this.routeValidating && this.plan && !this.plan.local) {
+            await this._handleMediaFailure(attachErr.message || "播放流加载失败", this.attachEpoch, false);
+            return;
+          }
+          throw attachErr;
+        }
       } catch (err) {
         if (epoch !== this.resolveEpoch || !this.active) return;
         clearTimeout(this.loadingDelayTimer);
+        clearTimeout(this.routeCheckTimer);
+        this.routeValidating = false;
+        this.loadingText = "";
         this.loading = false;
         this.errorText = err.message || "视频地址解析失败，请重试";
         this._syncUI();
@@ -885,6 +950,13 @@
       };
       if (reasonText) {
         API.addLog(`[播放器] ${reasonText}，启用 H.264 转码`);
+      }
+      if (this.routeValidating) {
+        const idx = (this.plan.routeIndex || 0) + 1;
+        const total = this.plan.routeCount || 1;
+        this.loading = true;
+        this.loadingText = total > 1 ? `线路 ${idx}/${total} 正在启用兼容转码校验...` : "正在启用兼容转码校验...";
+        this._syncUI();
       }
       toast("已自动启用 H.264 兼容模式播放");
       await this._attachStream(this.plan, epoch);
@@ -1009,6 +1081,9 @@
           this.ignoringMediaError = false;
           hls.loadSource(url);
           hls.attachMedia(video);
+          if (this.routeValidating && !(plan && plan.local)) {
+            this._armRouteValidationTimeout(epoch, curAttach, 12000);
+          }
           return;
         }
         if (!canNativeHls) {
@@ -1019,12 +1094,70 @@
       this.ignoringMediaError = false;
       video.src = url;
       video.load();
+      if (this.routeValidating && !(plan && plan.local)) {
+        const isTrans = url.includes("transcode=h264");
+        this._armRouteValidationTimeout(epoch, curAttach, isTrans ? 15000 : 12000);
+      }
+    }
+
+    _armRouteValidationTimeout(epoch, curAttach, timeoutMs) {
+      clearTimeout(this.routeCheckTimer);
+      if (!this.routeValidating || !this.active || !this.plan || this.plan.local) return;
+      const ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : 12000;
+      this.routeCheckTimer = setTimeout(() => {
+        if (!this.active || !this.routeValidating || epoch !== this.resolveEpoch || curAttach !== this.attachEpoch) return;
+        if (this._hasValidVideoPicture(this.video)) {
+          this._markRouteVerified();
+          return;
+        }
+        API.addLog("[播放器] 当前线路校验超时，尝试下一条线路");
+        this._handleMediaFailure("线路连接或解码超时", curAttach, false);
+      }, ms);
+    }
+
+    _markRouteVerified() {
+      clearTimeout(this.routeCheckTimer);
+      if (!this.routeValidating) {
+        if (this.loading) {
+          this.loading = false;
+          this._syncUI();
+        }
+        return;
+      }
+      const wasManual = this.routeCheckMode === "manual";
+      const hadSwitch = this.routeHadFailureSwitch;
+      const idx = this.plan ? (this.plan.routeIndex || 0) : 0;
+      const total = this.plan ? (this.plan.routeCount || 1) : 1;
+      this.routeValidating = false;
+      this.loadingText = "";
+      this.manualOriginIndex = -1;
+      this.manualOriginWasReady = false;
+      this.loading = false;
+      this._syncUI();
+      if (total > 1 && (wasManual || hadSwitch)) {
+        const msg = wasManual ? `已切换至可用线路 ${idx + 1}/${total}` : `线路 ${idx + 1}/${total} 校验可用，已自动切换`;
+        this._flashHud(msg, 1400);
+        toast(msg);
+      }
+    }
+
+    _buildAllRoutesUnavailableError(totalRoutes) {
+      if (this.routeCheckMode === "manual" && this.manualOriginWasReady && this.manualOriginIndex >= 0) {
+        return `其余备用线路均不可用（共 ${totalRoutes} 条），已停止校验`;
+      }
+      if (totalRoutes > 1) {
+        return `已校验全部 ${totalRoutes} 条线路，均不可用，已停止校验`;
+      }
+      return "当前线路不可用，暂无其他备用线路";
     }
 
     _onMediaReady() {
       if (!this.video) return;
+      const hasPic = this._hasValidVideoPicture(this.video);
       clearTimeout(this.loadingDelayTimer);
-      this.loading = false;
+      if (!this.routeValidating || hasPic || (this.plan && this.plan.local)) {
+        this.loading = false;
+      }
       this.errorText = "";
       this.video.playbackRate = this.speed;
       this.video.muted = this.muted;
@@ -1042,7 +1175,12 @@
       if (this.wantFullscreen && this._isShellFullscreen() && this._isLandscapeVideo()) {
         this._lockLandscapeIfSupported();
       }
-      this._syncUI();
+      if (hasPic) {
+        this._markRouteVerified();
+      } else {
+        this._scheduleNoVideoPictureCheck(this.video);
+        this._syncUI();
+      }
       this._ensureDanmakuWindow();
       this._queueNextPreload(450);
     }
@@ -1093,83 +1231,178 @@
       const msg = hevcUnsupported
         ? "当前浏览器不支持 HEVC (H.265) 视频硬件解码，请使用最新版 Edge / Chrome / Safari，或在服务端安装 FFmpeg 开启兼容转码"
         : "媒体解码或网络读取失败";
-      await this._handleMediaFailure(msg, curAttach, hevcUnsupported);
+      await this._handleMediaFailure(msg, curAttach, false);
     }
 
-    async _handleMediaFailure(reason, fromAttach, skipSameCodecRoutes) {
-      if (!this.active) return;
-      clearTimeout(this.loadingDelayTimer);
-      const epoch = this.resolveEpoch;
-      const maxFallbacks = Math.min(Math.max(0, (this.plan && this.plan.routeCount ? this.plan.routeCount : 1) - 1), 8);
-      if (
-        !skipSameCodecRoutes &&
-        this.plan &&
-        this.plan.session &&
-        (this.plan.routeIndex || 0) + 1 < (this.plan.routeCount || 1) &&
-        this.fallbackCount < maxFallbacks
-      ) {
-        this.fallbackCount++;
+    async _advanceToNextRoute(epoch, prevIdx, reason) {
+      if (!this.plan || !this.plan.session) {
+        return { advanced: false, exhausted: true, reason };
+      }
+      const totalRoutes = this.plan.routeCount || 1;
+      const isManual = this.routeCheckMode === "manual";
+      const stopAtOrigin = isManual && this.manualOriginWasReady && this.manualOriginIndex >= 0;
+
+      while ((this.plan.routeIndex || 0) + 1 < totalRoutes) {
+        const nextIdx = (this.plan.routeIndex || 0) + 1;
+        if (stopAtOrigin && nextIdx === this.manualOriginIndex) {
+          return { advanced: false, exhausted: true, reason };
+        }
+        this.routeValidating = true;
+        if (prevIdx >= 0) {
+          this.routeHadFailureSwitch = true;
+        }
         this.loading = true;
-        toast(`当前线路加载失败，正在切换备用线路 (${(this.plan.routeIndex || 0) + 2}/${this.plan.routeCount})...`);
+        this.loadingText = prevIdx >= 0
+          ? `线路 ${prevIdx + 1} 不可用，正在校验线路 ${nextIdx + 1}/${totalRoutes}...`
+          : `正在校验线路 ${nextIdx + 1}/${totalRoutes} 是否可用...`;
         this._syncUI();
         try {
-          const curPos = this.video ? this.video.currentTime : 0;
-          if (curPos > 1) this.resumePosition = curPos;
           const nextPlan = await API.rpc("fallback", { session: this.plan.session });
           if (epoch !== this.resolveEpoch || !this.active) {
             this._releasePlanSession(nextPlan);
-            return;
+            return { advanced: false, cancelled: true };
+          }
+          this.plan = nextPlan;
+          const actualIdx = nextPlan.routeIndex || 0;
+          if (this.routeFailedSet.has(actualIdx) || (stopAtOrigin && actualIdx === this.manualOriginIndex)) {
+            prevIdx = actualIdx;
+            continue;
           }
           this.triedTranscode = false;
           this.probedHlsForUrl = "";
           this.baseStreamUrl = "";
           this.transcodeOffset = 0;
           clearTimeout(this.noPictureTimer);
-          this.plan = nextPlan;
-          await this._attachStream(nextPlan, epoch);
-          return;
+          this._syncUI();
+          try {
+            await this._attachStream(nextPlan, epoch);
+            return { advanced: true };
+          } catch (attachErr) {
+            if (epoch !== this.resolveEpoch || !this.active) {
+              return { advanced: false, cancelled: true };
+            }
+            this.routeFailedSet.add(actualIdx);
+            prevIdx = actualIdx;
+            reason = attachErr.message || reason;
+          }
         } catch (err) {
-          if (epoch !== this.resolveEpoch) return;
-          reason = err.message || reason;
+          if (epoch !== this.resolveEpoch || !this.active) {
+            return { advanced: false, cancelled: true };
+          }
+          return { advanced: false, exhausted: true, reason: err.message || reason };
         }
       }
+
+      if (isManual && totalRoutes > 1) {
+        let wrapTarget = -1;
+        for (let i = 0; i < totalRoutes; i++) {
+          if (this.routeFailedSet.has(i)) continue;
+          if (stopAtOrigin && i === this.manualOriginIndex) continue;
+          wrapTarget = i;
+          break;
+        }
+        if (wrapTarget >= 0) {
+          const curPos = this._effectiveCurrentTime();
+          if (curPos > 1) this.resumePosition = curPos;
+          const prefix = prevIdx >= 0 ? `线路 ${prevIdx + 1} 不可用，继续校验` : "正在校验";
+          await this._loadEpisode(this.currentIndex, this.resumePosition, false, null, {
+            preserveFailedSet: true,
+            manualMode: true,
+            hadFailureSwitch: prevIdx >= 0,
+            targetRouteIndex: wrapTarget,
+            loadingPrefix: prefix,
+            loadingText: prevIdx >= 0
+              ? `线路 ${prevIdx + 1} 不可用，正在校验线路 ${wrapTarget + 1}/${totalRoutes}...`
+              : `正在校验线路 ${wrapTarget + 1}/${totalRoutes} 是否可用...`
+          });
+          return { advanced: true };
+        }
+      }
+
+      return { advanced: false, exhausted: true, reason };
+    }
+
+    async _handleMediaFailure(reason, fromAttach, skipSameCodecRoutes) {
+      if (!this.active) return;
+      if (fromAttach !== undefined && fromAttach !== null) {
+        if (fromAttach !== this.attachEpoch || this.routeFailureHandledAttach === fromAttach) return;
+        this.routeFailureHandledAttach = fromAttach;
+      }
+      clearTimeout(this.loadingDelayTimer);
+      clearTimeout(this.routeCheckTimer);
+      clearTimeout(this.noPictureTimer);
+      const epoch = this.resolveEpoch;
+      const curIdx = this.plan ? (this.plan.routeIndex || 0) : 0;
+      const totalRoutes = this.plan ? (this.plan.routeCount || 1) : 1;
+      if (this.plan && !this.plan.local) {
+        this.routeFailedSet.add(curIdx);
+      }
+
+      if (!skipSameCodecRoutes && this.plan && !this.plan.local && this.plan.session && totalRoutes > 1) {
+        const curPos = this._effectiveCurrentTime();
+        if (curPos > 1) this.resumePosition = curPos;
+        const result = await this._advanceToNextRoute(epoch, curIdx, reason);
+        if (result.cancelled || result.advanced) return;
+        if (result.reason) reason = result.reason;
+      }
+
+      if (epoch !== this.resolveEpoch || !this.active) return;
+      this.routeValidating = false;
+      this.loadingText = "";
       this.loading = false;
-      this.errorText = reason || "播放出错，请尝试切换线路或重试";
+      const summary = this._buildAllRoutesUnavailableError(totalRoutes);
+      this.errorText = reason && !reason.includes(summary) ? `${summary}（${reason}）` : summary;
+      toast(summary);
       this._syncUI();
     }
 
     async switchRouteManually() {
-      if (!this.plan || !this.plan.session) return;
-      if ((this.plan.routeIndex || 0) + 1 >= (this.plan.routeCount || 1)) {
-        await this._loadEpisode(this.currentIndex, this.video ? this.video.currentTime : 0, false);
+      if (!this.plan || !this.plan.session) {
+        if (this.loading) {
+          toast("正在解析播放线路，请稍候...");
+        }
         return;
       }
+      if (this.plan.local) return;
+      const totalRoutes = this.plan.routeCount || 1;
+      if (totalRoutes <= 1) {
+        toast("当前仅 1 条线路，无其他备用线路");
+        return;
+      }
+
+      const curIdx = this.plan.routeIndex || 0;
+      if (!this.routeValidating) {
+        this.manualOriginIndex = curIdx;
+        this.manualOriginWasReady = !this.errorText && this._hasValidVideoPicture(this.video);
+        if (this.errorText || !this.manualOriginWasReady) {
+          this.routeFailedSet.add(curIdx);
+        }
+      } else {
+        this.routeFailedSet.add(curIdx);
+      }
+
       const epoch = ++this.resolveEpoch;
       clearTimeout(this.loadingDelayTimer);
-      const curPos = this.video ? this.video.currentTime : 0;
+      clearTimeout(this.routeCheckTimer);
+      clearTimeout(this.noPictureTimer);
+      const curPos = this._effectiveCurrentTime();
       if (curPos > 1) this.resumePosition = curPos;
-      this.loading = true;
+
+      this.routeCheckMode = "manual";
+      this.routeValidating = true;
+      this.routeHadFailureSwitch = false;
       this.errorText = "";
+
+      const result = await this._advanceToNextRoute(epoch, -1, "");
+      if (result.cancelled || result.advanced) return;
+      if (epoch !== this.resolveEpoch || !this.active) return;
+
+      this.routeValidating = false;
+      this.loadingText = "";
+      this.loading = false;
+      this.errorText = this._buildAllRoutesUnavailableError(totalRoutes);
+      toast(this.errorText);
       this._syncUI();
-      try {
-        const nextPlan = await API.rpc("fallback", { session: this.plan.session });
-        if (epoch !== this.resolveEpoch || !this.active) {
-          this._releasePlanSession(nextPlan);
-          return;
-        }
-        this.triedTranscode = false;
-        this.probedHlsForUrl = "";
-        this.plan = nextPlan;
-        await this._attachStream(nextPlan, epoch);
-        const msg = `已切换至线路 ${(nextPlan.routeIndex || 0) + 1}/${nextPlan.routeCount || 1}`;
-        this._flashHud(msg, 1200);
-        toast(msg);
-      } catch (err) {
-        if (epoch !== this.resolveEpoch) return;
-        this.loading = false;
-        this.errorText = err.message || "切换线路失败";
-        this._syncUI();
-      }
     }
 
     async changeQuality(q) {
@@ -1637,12 +1870,17 @@
             return;
           }
           if (v !== this.video) return;
-          this._scheduleNoVideoPictureCheck(v);
+          if (this._hasValidVideoPicture(v)) {
+            this._markRouteVerified();
+          } else {
+            this._scheduleNoVideoPictureCheck(v);
+          }
         });
         v.addEventListener("resize", () => {
           if (v !== this.video) return;
           if (this._hasValidVideoPicture(v)) {
             clearTimeout(this.noPictureTimer);
+            this._markRouteVerified();
           }
           this._syncFullscreenState();
         });
@@ -1655,11 +1893,15 @@
           }
           if (v !== this.video) return;
           clearTimeout(this.loadingDelayTimer);
-          if (this.loading) {
-            this.loading = false;
-            this._syncUI();
+          if (this._hasValidVideoPicture(v)) {
+            this._markRouteVerified();
+          } else {
+            if (!this.routeValidating && this.loading) {
+              this.loading = false;
+              this._syncUI();
+            }
+            this._scheduleNoVideoPictureCheck(v);
           }
-          this._scheduleNoVideoPictureCheck(v);
         });
         v.addEventListener("waiting", () => {
           if (v !== this.video) return;
@@ -1670,9 +1912,14 @@
         v.addEventListener("playing", () => {
           if (v !== this.video) return;
           clearTimeout(this.loadingDelayTimer);
-          if (this.loading) {
-            this.loading = false;
-            this._syncUI();
+          if (this._hasValidVideoPicture(v)) {
+            this._markRouteVerified();
+          } else {
+            if (!this.routeValidating && this.loading) {
+              this.loading = false;
+              this._syncUI();
+            }
+            this._scheduleNoVideoPictureCheck(v);
           }
           if (!this._hudFlashUntil || Date.now() >= this._hudFlashUntil) {
             this._showHud("");
@@ -1682,7 +1929,6 @@
           if (this.controlsVisible) {
             this._showControlsTemporarily();
           }
-          this._scheduleNoVideoPictureCheck(v);
           this._queueNextPreload(450);
         });
         v.addEventListener("pause", () => {
@@ -2259,8 +2505,12 @@
       const routeBtn = this.shell.querySelector('[data-act="route"]');
       if (this.plan && !this.plan.local && (this.plan.routeCount || 1) > 1) {
         routeBtn.classList.remove("hidden");
-        routeBtn.textContent = `线路 ${(this.plan.routeIndex || 0) + 1}/${this.plan.routeCount}`;
+        const rIdx = (this.plan.routeIndex || 0) + 1;
+        const rTotal = this.plan.routeCount;
+        routeBtn.classList.toggle("active", !!this.routeValidating);
+        routeBtn.textContent = this.routeValidating ? `校验中 ${rIdx}/${rTotal}` : `线路 ${rIdx}/${rTotal}`;
       } else {
+        routeBtn.classList.remove("active");
         routeBtn.classList.add("hidden");
       }
 
@@ -2290,18 +2540,37 @@
       const center = this.shell.querySelector(".player-center-state");
       if (this.loading) {
         center.classList.remove("hidden");
-        center.innerHTML = `<div class="boot-spinner"></div><div>正在解析第 ${this.currentIndex} 集播放流...</div>`;
+        const msg = this.loadingText || `正在解析第 ${this.currentIndex} 集播放流...`;
+        const hint = this.routeValidating && this.plan && (this.plan.routeCount || 1) > 1
+          ? `<div style="font-size:12px;color:rgba(255,255,255,0.72);">若当前线路不可用将自动校验下一条线路</div>`
+          : "";
+        center.innerHTML = `<div class="boot-spinner"></div><div>${esc(msg)}</div>${hint}`;
       } else if (this.errorText) {
-        const canFallback = this.plan && this.plan.session && (this.plan.routeIndex || 0) + 1 < (this.plan.routeCount || 1);
+        const canRestoreOrigin = this.manualOriginWasReady && this.manualOriginIndex >= 0;
+        const canContinueNext =
+          this.plan &&
+          this.plan.session &&
+          (this.plan.routeIndex || 0) + 1 < (this.plan.routeCount || 1) &&
+          this.routeFailedSet.size < (this.plan.routeCount || 1);
         center.classList.remove("hidden");
         center.innerHTML = `
           <div style="font-size:15px;font-weight:700;max-width:440px;">${esc(this.errorText)}</div>
           <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:6px;">
-            <button class="btn btn-primary" id="p-err-retry">重新解析</button>
-            ${canFallback ? `<button class="btn" id="p-err-fallback">切换备用线路</button>` : ""}
+            ${canRestoreOrigin ? `<button class="btn btn-primary" id="p-err-restore">恢复线路 ${this.manualOriginIndex + 1}</button>` : ""}
+            <button class="btn ${canRestoreOrigin ? "" : "btn-primary"}" id="p-err-retry">重新校验全部线路</button>
+            ${canContinueNext ? `<button class="btn" id="p-err-fallback">继续校验下一线路</button>` : ""}
             <button class="btn" id="p-err-close">关闭播放器</button>
           </div>
         `;
+        const restoreBtn = center.querySelector("#p-err-restore");
+        if (restoreBtn) {
+          const targetIdx = this.manualOriginIndex;
+          restoreBtn.onclick = () =>
+            this._loadEpisode(this.currentIndex, this.resumePosition, false, null, {
+              targetRouteIndex: targetIdx,
+              loadingPrefix: "正在恢复"
+            });
+        }
         center.querySelector("#p-err-retry").onclick = () => this._loadEpisode(this.currentIndex, this.resumePosition, false);
         const fb = center.querySelector("#p-err-fallback");
         if (fb) fb.onclick = () => this.switchRouteManually();
