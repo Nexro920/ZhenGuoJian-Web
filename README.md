@@ -8,7 +8,7 @@
 
 > **仓库说明**：本仓库基于原项目 [**wzdyf1992/ZhenGuoJian-Web**](https://github.com/wzdyf1992/ZhenGuoJian-Web) 复制并维护，在保留原有特性与 GPL-3.0 开源协议的基础上，针对 Windows 开箱即用、全站源解锁、多站源解析兼容性、HEVC 无画面转码与前端分页体验修复了若干问题。
 >
-> 移动端原生客户端（Android / Android TV / iOS）见原仓库姐妹项目：[**ZhenGuoJian-Mobile**](https://github.com/wzdyf1992/ZhenGuoJian-Mobile)。两个项目的备份文件（`schema: 1`）完全互通。
+> **姐妹项目联动**：移动端 / 电视端原生客户端（Android / Android TV 独立 APK，内置全站源默认开放、纯 Go CENC 实时解密、ExoPlayer 硬解与播放线路记忆）见 [**Nexro920/ZhenGuoJian-Mobile**](https://github.com/Nexro920/ZhenGuoJian-Mobile)。网页版与移动端共用同源核心，且备份文件（`schema: 1`）完全互通。
 
 ---
 
